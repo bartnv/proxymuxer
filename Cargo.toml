@@ -1,0 +1,8 @@
+[package]
+name = "proxymuxer"
+version = "0.1.0"
+authors = ["Bart Noordervliet <bart@mmvi.nl>"]
+
+[dependencies]
+yaml-rust = "0.3"
+mio = "0.6.9"
