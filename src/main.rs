@@ -1,18 +1,12 @@
 extern crate yaml_rust;
-extern crate mio;
 
 use std::fs::File;
-use std::io::{self, Read};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream, Ipv6Addr};
 use std::time::Duration;
 use std::thread;
 use std::process::Command;
-use std::collections::HashMap;
 use yaml_rust::YamlLoader;
-use mio::{Events, Ready, Poll, PollOpt, Token};
-use mio::tcp::TcpListener;
-
-const LISTENER: Token = Token(0);
 
 #[derive(Clone)]
 struct App {
@@ -21,9 +15,10 @@ struct App {
   sshargs: String
 }
 
-struct Conn {
-  token: Token(),
-
+struct Server {
+    hostname: String,
+    portno: i64,
+    online: bool
 }
 
 fn main() {
@@ -33,6 +28,7 @@ fn main() {
   file.read_to_string(&mut config_str).unwrap();
   let docs = YamlLoader::load_from_str(&config_str).unwrap();
   let config = &docs[0];
+  let io_timeout = Duration::new(300, 0); // 5 minutes
 
   if !config["listenport"].is_badvalue() {
       app.listenport = config["listenport"].as_i64().expect("Invalid 'listenport' setting in config.yml");
@@ -47,28 +43,30 @@ fn main() {
   }
   println!("Using ssh arguments: {}", app.sshargs);
 
-  for server in config["servers"].as_vec().expect("Invalid 'servers' setting in config.yml") {
-    let hostname = server.as_str().expect("Invalid entry in 'servers' setting in config.yml").to_owned();
-    let portno = app.startport;
+  for entry in config["servers"].as_vec().expect("Invalid 'servers' setting in config.yml") {
+    let hostname = entry.as_str().expect("Invalid entry in 'servers' setting in config.yml").to_owned();
+    let mut server = Server { hostname: hostname, portno: app.startport, online: false };
     let argstring = app.sshargs.clone();
     app.startport += 1;
-    println!("Found server {}", hostname);
+    println!("Found server {}", server.hostname);
     thread::spawn(move || {
       let recon_delay = Duration::new(60, 0);
       loop {
-        println!("Connecting to {} with listen port {}", hostname, portno);
+        println!("Connecting to {} with listen port {}", server.hostname, server.portno);
         let argvec: Vec<&str> = argstring.split_whitespace().collect();
         let mut child = Command::new("ssh")
                                 .arg("-D")
-                                .arg(format!("localhost:{}", portno))
+                                .arg(format!("localhost:{}", server.portno))
                                 .args(argvec)
-                                .arg(hostname.clone())
-                                .spawn().expect(&format!("Failed to launch ssh session to {}", hostname));
+                                .arg(server.hostname.clone())
+                                .spawn().expect(&format!("Failed to launch ssh session to {}", server.hostname));
+        server.online = true;
         let ecode = child.wait().expect("Failed to wait on child");
+        server.online = false;
         if !ecode.success() {
             match ecode.code() {
-                Some(code) => println!("Ssh session for {} failed with exit code {}", hostname, code),
-                None => println!("Ssh session for {} was killed by a signal", hostname)
+                Some(code) => println!("Ssh session for {} failed with exit code {}", server.hostname, code),
+                None => println!("Ssh session for {} was killed by a signal", server.hostname)
             }
         }
         println!("Waiting {} seconds before reconnecting...", recon_delay.as_secs());
@@ -77,46 +75,134 @@ fn main() {
     });
   }
 
-  let poll = Poll::new().unwrap();
-  let listener = TcpListener::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), app.listenport as u16)).unwrap();
-  poll.register(&listener, LISTENER, Ready::readable(), PollOpt::edge()).unwrap();
-  let mut events = Events::with_capacity(1024);
-  let mut sockets = HashMap::new();
-  let mut next_socket_index = 0;
-
-  loop {
-    poll.poll(&mut events, None).unwrap();
-    for event in &events {
-      match event.token() {
-        LISTENER => {
-          loop {
-            match listener.accept() {
-              Ok((socket, _)) => {
-                let token = Token(next_socket_index);
-                next_socket_index += 1;
-
-                poll.register(&socket, token, Ready::readable(), PollOpt::edge()).unwrap();
-                sockets.insert(token, socket);
+  let server = TcpListener::bind(("0.0.0.0", app.listenport as u16)).unwrap();
+  for client in server.incoming() {
+    let mut stream = client.unwrap();
+    stream.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
+    stream.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
+    let addr = stream.peer_addr().unwrap();
+    thread::spawn(move || {
+      let mut req: [u8; 2048] = [0; 2048];
+      match stream.read(&mut req) {
+        Ok(c) => {
+          if c == 0 {
+            println!("CLOSE from {}", addr);
+            return;
+          }
+          if req[0] == 5 {
+            match stream.write(b"\x05\x00") {
+              Ok(_) => {}
+              Err(e) => {
+                println!("WRITE ERROR to {}: {}", addr, e.to_string());
+                return;
               }
-              Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => { break; }
-              e => panic!("err={:?}", e)
             }
           }
-        }
-        token => {
-          loop {
-            // match sockets.get_mut(&token).unwrap().read(&mut buf) {
-            //   Ok(0) => {  // Socket is closed, remove it from the map
-            //     sockets.remove(&token);
-            //     break;
-            //   }
-            //   Ok(_) => unreachable!(),
-            //   Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => { continue; }
-            //   e => panic!("err={:?}", e)
-            // }
+          else {
+            println!("Invalid auth request from {}", addr);
+            return;
           }
         }
+        Err(e) => {
+          println!("READ ERROR from {}: {}", addr, e.to_string());
+          return;
+        }
       }
-    }
+      match stream.read(&mut req) {
+        Ok(c) => {
+          if c == 0 {
+            println!("CLOSE from {}", addr);
+            return;
+          }
+          if &req[0..3] == b"\x05\x01\x00" {
+            let mut conn = None;
+            if req[3] == b'\x01' { // IPv4
+              let mut portno = req[8] as u16;
+              portno += req[9] as u16 >> 8;
+              println!("Requested connection to IPv4 {}.{}.{}.{} port {}", req[4], req[5], req[6], req[7], portno);
+            }
+            else if req[3] == b'\x03' { // Hostname
+              let length = req[4] as usize;
+              let hostname = String::from_utf8_lossy(&req[5..(5+length)]);
+              let mut portno = (req[5+length] as u16) << 8;
+              portno += req[5+length+1] as u16;
+              println!("Requested connection to {} port {}", hostname, portno);
+              conn = Some(TcpStream::connect("127.0.0.1:50841").expect("Failed to connect to tunnel port"));
+            }
+            else if req[3] == b'\x04' { // IPv6
+              let mut address: [u8; 16] = Default::default();
+              address.copy_from_slice(&req[4..20]);
+              let mut portno = req[20] as u16;
+              portno += req[21] as u16 >> 8;
+              println!("Requested connection to IPv6 {} port {}", Ipv6Addr::from(address), portno);
+            }
+            else {
+              println!("Invalid connection request from {}", addr);
+              return;
+            }
+            let mut tunnel = conn.unwrap();
+            tunnel.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
+            tunnel.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
+            let _ = tunnel.write(b"\x05\x01\x00").unwrap();
+            let mut buf: [u8; 1500] = [0; 1500];
+            let _ = tunnel.read(&mut buf).unwrap();
+            let _ = tunnel.write(&req[0..c]).unwrap();
+            let mut tunnel_read = tunnel.try_clone().expect("Failed to clone tunnel TcpStream");
+            let mut stream_write = stream.try_clone().expect("Failed to clone client TcpStream");
+            thread::spawn(move || {
+              let mut buf: [u8; 1500] = [0; 1500];
+              let mut count = 0;
+              loop {
+                match tunnel_read.read(&mut buf) {
+                  Ok(c) => {
+                    if c == 0 {
+                      println!("Closed after {} bytes inbound", count);
+                      return;
+                    }
+                    count += c;
+                    if let Err(_) = stream_write.write_all(&buf[0..c]) {
+                      println!("Write error on client");
+                      return;
+                    }
+                  }
+                  Err(_) => {
+                    println!("Read error on tunnel");
+                    return;
+                  }
+                }
+              }
+            });
+            let mut count = 0;
+            loop {
+              match stream.read(&mut buf) {
+                Ok(c) => {
+                  if c == 0 {
+                    println!("Closed after {} bytes outbound", count);
+                    return;
+                  }
+                  count += c;
+                  if let Err(_) = tunnel.write_all(&buf[0..c]) {
+                    println!("Write error on tunnel");
+                    return;
+                  }
+                }
+                Err(_) => {
+                  println!("Read error on client");
+                  return;
+                }
+              }
+            }
+          }
+          else {
+            println!("Invalid connection request from {}", addr);
+            return;
+          }
+        }
+        Err(e) => {
+          println!("READ ERROR from {}: {}", addr, e.to_string());
+          return;
+        }
+      }
+    });
   }
 }
