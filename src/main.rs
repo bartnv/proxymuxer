@@ -2,13 +2,15 @@ extern crate yaml_rust;
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, Ipv6Addr};
+use std::net::{TcpListener, TcpStream, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use std::thread;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use yaml_rust::YamlLoader;
 
 #[derive(Clone)]
@@ -81,6 +83,7 @@ fn main() {
       }
     });
   }
+  let servers = servers; // Make immutable
 
   let server = TcpListener::bind(("0.0.0.0", app.listenport as u16)).unwrap();
   for client in server.incoming() {
@@ -123,39 +126,53 @@ fn main() {
             return;
           }
           if &req[0..3] == b"\x05\x01\x00" {
-            let mut conn = None;
+            let idx;
             if req[3] == b'\x01' { // IPv4
-              let mut portno = req[8] as u16;
-              portno += req[9] as u16 >> 8;
-              println!("Requested connection to IPv4 {}.{}.{}.{} port {}", req[4], req[5], req[6], req[7], portno);
+              let address = Ipv4Addr::new(req[4], req[5], req[6], req[7]);
+              let host = format!("{}", address);
+              let mut port = req[8] as u16;
+              port += req[9] as u16 >> 8;
+              match select_server(&servers, &host, port) {
+                Ok(i) => idx = i,
+                Err(msg) => {
+                  println!("{}", msg);
+                  return;
+                }
+              }
             }
             else if req[3] == b'\x03' { // Hostname
               let length = req[4] as usize;
-              let hostname = String::from_utf8_lossy(&req[5..(5+length)]);
-              let mut portno = (req[5+length] as u16) << 8;
-              portno += req[5+length+1] as u16;
-              println!("Requested connection to {} port {}", hostname, portno);
-              let serverno = 0;
-              let server = servers.get(serverno).unwrap();
-              println!("Selected server {} ({:?}) of {}", serverno+1, server, servers.len());
-              if server.online.load(Ordering::Relaxed) != true {
-                println!("Selected server is offline");
-                return;
+              let host = String::from_utf8_lossy(&req[5..(5+length)]);
+              let mut port = (req[5+length] as u16) << 8;
+              port += req[5+length+1] as u16;
+              match select_server(&servers, &host, port) {
+                Ok(i) => idx = i,
+                Err(msg) => {
+                  println!("{}", msg);
+                  return;
+                }
               }
-              conn = Some(TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port"));
             }
             else if req[3] == b'\x04' { // IPv6
               let mut address: [u8; 16] = Default::default();
               address.copy_from_slice(&req[4..20]);
-              let mut portno = req[20] as u16;
-              portno += req[21] as u16 >> 8;
-              println!("Requested connection to IPv6 {} port {}", Ipv6Addr::from(address), portno);
+              let host = format!("{}", Ipv6Addr::from(address));
+              let mut port = req[20] as u16;
+              port += req[21] as u16 >> 8;
+              match select_server(&servers, &host, port) {
+                Ok(i) => idx = i,
+                Err(msg) => {
+                  println!("{}", msg);
+                  return;
+                }
+              }
             }
             else {
               println!("Invalid connection request from {}", addr);
               return;
             }
-            let mut tunnel = conn.unwrap();
+            let server = servers.get(idx).expect("selectServer() returned invalid index");
+            let mut tunnel = TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port");
             tunnel.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
             tunnel.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
             let _ = tunnel.write(b"\x05\x01\x00").unwrap();
@@ -220,4 +237,17 @@ fn main() {
       }
     });
   }
+}
+
+fn select_server(servers: &Vec<Server>, host: &str, port: u16) -> Result<usize, &'static str> {
+  let mut hasher = DefaultHasher::new();
+  host.hash(&mut hasher);
+  let hash = hasher.finish() as usize;
+  let serverno = hash%servers.len();
+  let server = servers.get(serverno).unwrap();
+  println!("Host {} port {} selected server {} ({:?}) of {}", host, port, serverno+1, server, servers.len());
+  if server.online.load(Ordering::Relaxed) != true {
+    return Err("Selected server is offline");
+  }
+  Ok(serverno)
 }
