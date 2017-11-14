@@ -2,4 +2,5 @@ listenport: 8090
 startport: 50841
 sshargs: -N -o Batchmode=yes -o ConnectTimeout=10 -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=2
 servers:
-  - server1.example.com
+  - user@server1.example.com
+  - user@server2.example.com
