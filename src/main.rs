@@ -6,6 +6,9 @@ use std::net::{TcpListener, TcpStream, Ipv6Addr};
 use std::time::Duration;
 use std::thread;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use yaml_rust::YamlLoader;
 
 #[derive(Clone)]
@@ -15,10 +18,11 @@ struct App {
   sshargs: String
 }
 
+#[derive(Clone, Debug)]
 struct Server {
     hostname: String,
     portno: i64,
-    online: bool
+    online: Arc<AtomicBool>
 }
 
 fn main() {
@@ -43,9 +47,12 @@ fn main() {
   }
   println!("Using ssh arguments: {}", app.sshargs);
 
+  let mut servers: Vec<Server> = Vec::new();
+
   for entry in config["servers"].as_vec().expect("Invalid 'servers' setting in config.yml") {
     let hostname = entry.as_str().expect("Invalid entry in 'servers' setting in config.yml").to_owned();
-    let mut server = Server { hostname: hostname, portno: app.startport, online: false };
+    let server = Server { hostname: hostname, portno: app.startport, online: Arc::new(AtomicBool::new(false)) };
+    servers.push(server.clone());
     let argstring = app.sshargs.clone();
     app.startport += 1;
     println!("Found server {}", server.hostname);
@@ -60,9 +67,9 @@ fn main() {
                                 .args(argvec)
                                 .arg(server.hostname.clone())
                                 .spawn().expect(&format!("Failed to launch ssh session to {}", server.hostname));
-        server.online = true;
+        server.online.store(true, Ordering::Relaxed);
         let ecode = child.wait().expect("Failed to wait on child");
-        server.online = false;
+        server.online.store(false, Ordering::Relaxed);
         if !ecode.success() {
             match ecode.code() {
                 Some(code) => println!("Ssh session for {} failed with exit code {}", server.hostname, code),
@@ -81,6 +88,7 @@ fn main() {
     stream.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
     stream.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
     let addr = stream.peer_addr().unwrap();
+    let servers = servers.clone();
     thread::spawn(move || {
       let mut req: [u8; 2048] = [0; 2048];
       match stream.read(&mut req) {
@@ -127,7 +135,14 @@ fn main() {
               let mut portno = (req[5+length] as u16) << 8;
               portno += req[5+length+1] as u16;
               println!("Requested connection to {} port {}", hostname, portno);
-              conn = Some(TcpStream::connect("127.0.0.1:50841").expect("Failed to connect to tunnel port"));
+              let serverno = 0;
+              let server = servers.get(serverno).unwrap();
+              println!("Selected server {} ({:?}) of {}", serverno+1, server, servers.len());
+              if server.online.load(Ordering::Relaxed) != true {
+                println!("Selected server is offline");
+                return;
+              }
+              conn = Some(TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port"));
             }
             else if req[3] == b'\x04' { // IPv6
               let mut address: [u8; 16] = Default::default();
