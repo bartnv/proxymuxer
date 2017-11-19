@@ -3,11 +3,11 @@ extern crate yaml_rust;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, Ipv4Addr, Ipv6Addr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::thread;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, ATOMIC_USIZE_INIT};
 use std::sync::atomic::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -26,6 +26,8 @@ struct Server {
     portno: i64,
     online: Arc<AtomicBool>
 }
+
+static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
 
 fn main() {
   let mut app = App { listenport: 8080, startport: 61234, sshargs: String::from("-N") };
@@ -93,6 +95,8 @@ fn main() {
     let addr = stream.peer_addr().unwrap();
     let servers = servers.clone();
     thread::spawn(move || {
+      let threads = THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+      let start = Instant::now();
       let mut req: [u8; 2048] = [0; 2048];
       match stream.read(&mut req) {
         Ok(c) => {
@@ -121,6 +125,9 @@ fn main() {
       }
       match stream.read(&mut req) {
         Ok(c) => {
+          let host;
+          let mut port;
+
           if c == 0 {
             println!("CLOSE from {}", addr);
             return;
@@ -129,10 +136,10 @@ fn main() {
             let idx;
             if req[3] == b'\x01' { // IPv4
               let address = Ipv4Addr::new(req[4], req[5], req[6], req[7]);
-              let host = format!("{}", address);
-              let mut port = req[8] as u16;
+              host = format!("{}", address);
+              port = req[8] as u16;
               port += req[9] as u16 >> 8;
-              match select_server(&servers, &host, port) {
+              match select_server(&threads, &servers, &host, port) {
                 Ok(i) => idx = i,
                 Err(msg) => {
                   println!("{}", msg);
@@ -142,10 +149,10 @@ fn main() {
             }
             else if req[3] == b'\x03' { // Hostname
               let length = req[4] as usize;
-              let host = String::from_utf8_lossy(&req[5..(5+length)]);
-              let mut port = (req[5+length] as u16) << 8;
+              host = String::from_utf8_lossy(&req[5..(5+length)]).into_owned();
+              port = (req[5+length] as u16) << 8;
               port += req[5+length+1] as u16;
-              match select_server(&servers, &host, port) {
+              match select_server(&threads, &servers, &host, port) {
                 Ok(i) => idx = i,
                 Err(msg) => {
                   println!("{}", msg);
@@ -156,10 +163,10 @@ fn main() {
             else if req[3] == b'\x04' { // IPv6
               let mut address: [u8; 16] = Default::default();
               address.copy_from_slice(&req[4..20]);
-              let host = format!("{}", Ipv6Addr::from(address));
-              let mut port = req[20] as u16;
+              host = format!("{}", Ipv6Addr::from(address));
+              port = req[20] as u16;
               port += req[21] as u16 >> 8;
-              match select_server(&servers, &host, port) {
+              match select_server(&threads, &servers, &host, port) {
                 Ok(i) => idx = i,
                 Err(msg) => {
                   println!("{}", msg);
@@ -177,29 +184,26 @@ fn main() {
             tunnel.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
             let _ = tunnel.write(b"\x05\x01\x00").unwrap();
             let mut buf: [u8; 1500] = [0; 1500];
-            let _ = tunnel.read(&mut buf).unwrap();
+            let _ = tunnel.read(&mut buf).unwrap(); // TODO: check the SOCKS5 response here
             let _ = tunnel.write(&req[0..c]).unwrap();
             let mut tunnel_read = tunnel.try_clone().expect("Failed to clone tunnel TcpStream");
             let mut stream_write = stream.try_clone().expect("Failed to clone client TcpStream");
-            thread::spawn(move || {
+            let inbound = thread::spawn(move || {
               let mut buf: [u8; 1500] = [0; 1500];
               let mut count = 0;
               loop {
                 match tunnel_read.read(&mut buf) {
                   Ok(c) => {
-                    if c == 0 {
-                      println!("Closed after {} bytes inbound", count);
-                      return;
-                    }
+                    if c == 0 { return count; }
                     count += c;
                     if let Err(_) = stream_write.write_all(&buf[0..c]) {
                       println!("Write error on client");
-                      return;
+                      return 0;
                     }
                   }
                   Err(_) => {
                     println!("Read error on tunnel");
-                    return;
+                    return 0;
                   }
                 }
               }
@@ -208,10 +212,7 @@ fn main() {
             loop {
               match stream.read(&mut buf) {
                 Ok(c) => {
-                  if c == 0 {
-                    println!("Closed after {} bytes outbound", count);
-                    return;
-                  }
+                  if c == 0 { break; }
                   count += c;
                   if let Err(_) = tunnel.write_all(&buf[0..c]) {
                     println!("Write error on tunnel");
@@ -224,6 +225,10 @@ fn main() {
                 }
               }
             }
+            match inbound.join() {
+              Ok(c) => println!("Host {} port {} finished with {}b headers {}b data {}s duration", host, port, count, c, start.elapsed().as_secs()),
+              Err(_) => println!("Host {} port {} reading thread panicked", host, port)
+            }
           }
           else {
             println!("Invalid connection request from {}", addr);
@@ -235,17 +240,18 @@ fn main() {
           return;
         }
       }
+      THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
     });
   }
 }
 
-fn select_server(servers: &Vec<Server>, host: &str, port: u16) -> Result<usize, &'static str> {
+fn select_server(theads: &usize, servers: &Vec<Server>, host: &str, port: u16) -> Result<usize, &'static str> {
   let mut hasher = DefaultHasher::new();
   host.hash(&mut hasher);
   let hash = hasher.finish() as usize;
   let serverno = hash%servers.len();
   let server = servers.get(serverno).unwrap();
-  println!("Host {} port {} selected server {} ({:?}) of {}", host, port, serverno+1, server, servers.len());
+  println!("{} Host {} port {} selected server {} ({:?}) of {}", theads, host, port, serverno+1, server, servers.len());
   if server.online.load(Ordering::Relaxed) != true {
     return Err("Selected server is offline");
   }
