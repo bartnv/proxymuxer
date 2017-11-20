@@ -1,8 +1,9 @@
 extern crate yaml_rust;
+extern crate regex;
 
 use std::fs::File;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, Ipv4Addr, Ipv6Addr};
+use std::io::{Read, Write, ErrorKind};
+use std::net::{TcpListener, TcpStream, Ipv6Addr};
 use std::time::{Duration, Instant};
 use std::thread;
 use std::process::Command;
@@ -12,6 +13,7 @@ use std::sync::atomic::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use yaml_rust::YamlLoader;
+use regex::Regex;
 
 #[derive(Clone)]
 struct App {
@@ -27,6 +29,19 @@ struct Server {
     online: Arc<AtomicBool>
 }
 
+struct Matches {
+  ipv4: Regex,
+  ipv6: Regex,
+  host1: Regex,
+  host2: Regex
+}
+
+struct Rule {
+  rule: String,
+  regex: Regex,
+  server: usize
+}
+
 static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
 
 fn main() {
@@ -37,6 +52,12 @@ fn main() {
   let docs = YamlLoader::load_from_str(&config_str).unwrap();
   let config = &docs[0];
   let io_timeout = Duration::new(300, 0); // 5 minutes
+  let re = Arc::new(Matches {
+    ipv4: Regex::new(r"^(\d{1,3}\.\d{1,3})\.\d{1,3}\.\d{1,3}$").unwrap(),
+    ipv6: Regex::new(r"^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+):").unwrap(),
+    host1: Regex::new(r"\.([^.]{4,}\.[a-z]+)$").unwrap(),
+    host2: Regex::new(r"\.([^.]{4,}\.[a-z]+\.[a-z]+)$").unwrap()
+  });
 
   if !config["listenport"].is_badvalue() {
       app.listenport = config["listenport"].as_i64().expect("Invalid 'listenport' setting in config.yml");
@@ -52,6 +73,7 @@ fn main() {
   println!("Using ssh arguments: {}", app.sshargs);
 
   let mut servers: Vec<Server> = Vec::new();
+  servers.push(Server { hostname: "direct".to_owned(), portno: 0, online: Arc::new(AtomicBool::new(true)) });
 
   for entry in config["servers"].as_vec().expect("Invalid 'servers' setting in config.yml") {
     let hostname = entry.as_str().expect("Invalid entry in 'servers' setting in config.yml").to_owned();
@@ -87,6 +109,16 @@ fn main() {
   }
   let servers = servers; // Make immutable
 
+  let mut rules = Vec::new();
+  for (rule, server) in config["rules"].as_hash().expect("Invalid 'rules' setting in config.yml") {
+    let rule = rule.as_str().expect("Invalid key in 'rules' setting in config.yml").to_owned();
+    let server = server.as_i64().expect("Invalid value in 'rules' setting in config.yml") as usize;
+    let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
+    rules.push(Rule { rule: rule, regex: Regex::new(&pattern).unwrap(), server: server });
+    println!("Added rule {}", pattern);
+  }
+  let rules = Arc::new(rules); // RefCount and make immutable
+
   let server = TcpListener::bind(("0.0.0.0", app.listenport as u16)).unwrap();
   for client in server.incoming() {
     let mut stream = client.unwrap();
@@ -94,6 +126,8 @@ fn main() {
     stream.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
     let addr = stream.peer_addr().unwrap();
     let servers = servers.clone();
+    let re = re.clone();
+    let rules = rules.clone();
     thread::spawn(move || {
       let threads = THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
       let start = Instant::now();
@@ -115,6 +149,11 @@ fn main() {
           }
           else {
             println!("Invalid auth request from {}", addr);
+            let mut s = String::new();
+            for &byte in req.iter() {
+              s.push_str(&format!("{:X} ", byte));
+            }
+            println!("Debug: {}", s);
             return;
           }
         }
@@ -133,13 +172,13 @@ fn main() {
             return;
           }
           if &req[0..3] == b"\x05\x01\x00" {
-            let idx;
+            let mut idx = 0;
+            let mut routing = "hash";
             if req[3] == b'\x01' { // IPv4
-              let address = Ipv4Addr::new(req[4], req[5], req[6], req[7]);
-              host = format!("{}", address);
+              host = format!("{}.{}", req[4], req[5]);
               port = req[8] as u16;
               port += req[9] as u16 >> 8;
-              match select_server(&threads, &servers, &host, port) {
+              match select_server(&servers, &host) {
                 Ok(i) => idx = i,
                 Err(msg) => {
                   println!("{}", msg);
@@ -152,21 +191,36 @@ fn main() {
               host = String::from_utf8_lossy(&req[5..(5+length)]).into_owned();
               port = (req[5+length] as u16) << 8;
               port += req[5+length+1] as u16;
-              match select_server(&threads, &servers, &host, port) {
-                Ok(i) => idx = i,
-                Err(msg) => {
-                  println!("{}", msg);
-                  return;
+              for rule in rules.iter() {
+                if rule.regex.is_match(&host) {
+                  idx = rule.server;
+                  routing = "rule";
+                  break;
+                }
+              }
+              if routing != "rule" {
+                let hashhost =
+                  if let Some(captures) = re.ipv4.captures(&host) { captures.get(1).unwrap().as_str() }
+                  else if let Some(captures) = re.ipv6.captures(&host) { captures.get(1).unwrap().as_str() }
+                  else if let Some(captures) = re.host1.captures(&host) { captures.get(1).unwrap().as_str() }
+                  else if let Some(captures) = re.host2.captures(&host) { captures.get(1).unwrap().as_str() }
+                  else { &host };
+                match select_server(&servers, hashhost) {
+                  Ok(i) => idx = i,
+                  Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                  }
                 }
               }
             }
             else if req[3] == b'\x04' { // IPv6
               let mut address: [u8; 16] = Default::default();
-              address.copy_from_slice(&req[4..20]);
+              address.copy_from_slice(&req[4..12]);
               host = format!("{}", Ipv6Addr::from(address));
               port = req[20] as u16;
               port += req[21] as u16 >> 8;
-              match select_server(&threads, &servers, &host, port) {
+              match select_server(&servers, &host) {
                 Ok(i) => idx = i,
                 Err(msg) => {
                   println!("{}", msg);
@@ -178,14 +232,36 @@ fn main() {
               println!("Invalid connection request from {}", addr);
               return;
             }
-            let server = servers.get(idx).expect("selectServer() returned invalid index");
-            let mut tunnel = TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port");
+            let server = servers.get(idx).expect("invalid server index");
+            if server.online.load(Ordering::Relaxed) != true {
+              println!("Selected server is offline");
+              return;
+            }
+            println!("{:2} connections | [{}] Routed {}:{} to server {} ({})", threads, routing, host, port, idx, server.hostname);
+            let mut tunnel = if idx == 0 {
+              match TcpStream::connect((&*host, port)) {
+                Ok(tunnel) => {
+                  stream.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00").unwrap();
+                  tunnel
+                },
+                Err(err) => {
+                  match err.kind() {
+                    ErrorKind::ConnectionRefused => { stream.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00").unwrap(); },
+                    _ => { stream.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00").unwrap(); }
+                  }
+                  return;
+                }
+              }
+            }
+            else { TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port") };
             tunnel.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
             tunnel.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
-            let _ = tunnel.write(b"\x05\x01\x00").unwrap();
             let mut buf: [u8; 1500] = [0; 1500];
-            let _ = tunnel.read(&mut buf).unwrap(); // TODO: check the SOCKS5 response here
-            let _ = tunnel.write(&req[0..c]).unwrap();
+            if idx != 0 {
+              let _ = tunnel.write(b"\x05\x01\x00").unwrap();
+              let _ = tunnel.read(&mut buf).unwrap(); // TODO: check the SOCKS5 response here
+              let _ = tunnel.write(&req[0..c]).unwrap();
+            }
             let mut tunnel_read = tunnel.try_clone().expect("Failed to clone tunnel TcpStream");
             let mut stream_write = stream.try_clone().expect("Failed to clone client TcpStream");
             let inbound = thread::spawn(move || {
@@ -226,7 +302,7 @@ fn main() {
               }
             }
             match inbound.join() {
-              Ok(c) => println!("Host {} port {} finished with {}b headers {}b data {}s duration", host, port, count, c, start.elapsed().as_secs()),
+              Ok(c) => {},//println!("Host {} port {} finished with {}b headers {}b data {}s duration", host, port, count, c, start.elapsed().as_secs()),
               Err(_) => println!("Host {} port {} reading thread panicked", host, port)
             }
           }
@@ -245,15 +321,11 @@ fn main() {
   }
 }
 
-fn select_server(theads: &usize, servers: &Vec<Server>, host: &str, port: u16) -> Result<usize, &'static str> {
+fn select_server(servers: &Vec<Server>, host: &str) -> Result<usize, &'static str> {
   let mut hasher = DefaultHasher::new();
   host.hash(&mut hasher);
   let hash = hasher.finish() as usize;
-  let serverno = hash%servers.len();
+  let serverno = (hash%(servers.len()-1))+1;
   let server = servers.get(serverno).unwrap();
-  println!("{} Host {} port {} selected server {} ({:?}) of {}", theads, host, port, serverno+1, server, servers.len());
-  if server.online.load(Ordering::Relaxed) != true {
-    return Err("Selected server is offline");
-  }
   Ok(serverno)
 }
