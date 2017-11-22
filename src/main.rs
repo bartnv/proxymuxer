@@ -75,15 +75,18 @@ fn main() {
   let mut servers: Vec<Server> = Vec::new();
   servers.push(Server { hostname: "direct".to_owned(), portno: 0, online: Arc::new(AtomicBool::new(true)) });
 
+  let mut count = 0;
   for entry in config["servers"].as_vec().expect("Invalid 'servers' setting in config.yml") {
+    count += 1;
     let hostname = entry.as_str().expect("Invalid entry in 'servers' setting in config.yml").to_owned();
     let server = Server { hostname: hostname, portno: app.startport, online: Arc::new(AtomicBool::new(false)) };
     servers.push(server.clone());
     let argstring = app.sshargs.clone();
     app.startport += 1;
-    println!("Found server {}", server.hostname);
+    println!("Added server {}: {}", count, server.hostname);
     thread::spawn(move || {
       let recon_delay = Duration::new(60, 0);
+      thread::sleep(Duration::new(1, 0));
       loop {
         println!("Connecting to {} with listen port {}", server.hostname, server.portno);
         let argvec: Vec<&str> = argstring.split_whitespace().collect();
@@ -114,8 +117,8 @@ fn main() {
     let rule = rule.as_str().expect("Invalid key in 'rules' setting in config.yml").to_owned();
     let server = server.as_i64().expect("Invalid value in 'rules' setting in config.yml") as usize;
     let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
+    println!("Added rule {} for server {}", &rule, &server);
     rules.push(Rule { rule: rule, regex: Regex::new(&pattern).unwrap(), server: server });
-    println!("Added rule {}", pattern);
   }
   let rules = Arc::new(rules); // RefCount and make immutable
 
@@ -130,7 +133,9 @@ fn main() {
     let rules = rules.clone();
     thread::spawn(move || {
       let threads = THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
-      let start = Instant::now();
+      let _start = Instant::now();
+      let proto;
+      let mut bytes = 0;
       let mut req: [u8; 2048] = [0; 2048];
       match stream.read(&mut req) {
         Ok(c) => {
@@ -138,7 +143,8 @@ fn main() {
             println!("CLOSE from {}", addr);
             return;
           }
-          if req[0] == 5 {
+          if req[0] == 5 { // SOCKS5
+            proto = 5;
             match stream.write(b"\x05\x00") {
               Ok(_) => {}
               Err(e) => {
@@ -146,6 +152,10 @@ fn main() {
                 return;
               }
             }
+          }
+          else if req[0] == 4 { // SOCKS4
+            proto = 4;
+            bytes = c;
           }
           else {
             println!("Invalid auth request from {}", addr);
@@ -162,159 +172,168 @@ fn main() {
           return;
         }
       }
-      match stream.read(&mut req) {
-        Ok(c) => {
-          let host;
-          let mut port;
-
-          if c == 0 {
-            println!("CLOSE from {}", addr);
-            return;
-          }
-          if &req[0..3] == b"\x05\x01\x00" {
-            let mut idx = 0;
-            let mut routing = "hash";
-            if req[3] == b'\x01' { // IPv4
-              host = format!("{}.{}", req[4], req[5]);
-              port = req[8] as u16;
-              port += req[9] as u16 >> 8;
-              match select_server(&servers, &host) {
-                Ok(i) => idx = i,
-                Err(msg) => {
-                  println!("{}", msg);
-                  return;
-                }
-              }
-            }
-            else if req[3] == b'\x03' { // Hostname
-              let length = req[4] as usize;
-              host = String::from_utf8_lossy(&req[5..(5+length)]).into_owned();
-              port = (req[5+length] as u16) << 8;
-              port += req[5+length+1] as u16;
-              for rule in rules.iter() {
-                if rule.regex.is_match(&host) {
-                  idx = rule.server;
-                  routing = "rule";
-                  break;
-                }
-              }
-              if routing != "rule" {
-                let hashhost =
-                  if let Some(captures) = re.ipv4.captures(&host) { captures.get(1).unwrap().as_str() }
-                  else if let Some(captures) = re.ipv6.captures(&host) { captures.get(1).unwrap().as_str() }
-                  else if let Some(captures) = re.host1.captures(&host) { captures.get(1).unwrap().as_str() }
-                  else if let Some(captures) = re.host2.captures(&host) { captures.get(1).unwrap().as_str() }
-                  else { &host };
-                match select_server(&servers, hashhost) {
-                  Ok(i) => idx = i,
-                  Err(msg) => {
-                    println!("{}", msg);
-                    return;
-                  }
-                }
-              }
-            }
-            else if req[3] == b'\x04' { // IPv6
-              let mut address: [u8; 16] = Default::default();
-              address.copy_from_slice(&req[4..12]);
-              host = format!("{}", Ipv6Addr::from(address));
-              port = req[20] as u16;
-              port += req[21] as u16 >> 8;
-              match select_server(&servers, &host) {
-                Ok(i) => idx = i,
-                Err(msg) => {
-                  println!("{}", msg);
-                  return;
-                }
-              }
-            }
-            else {
-              println!("Invalid connection request from {}", addr);
+      if proto == 5 {
+        match stream.read(&mut req) {
+          Ok(c) => match c {
+            0 => {
+              println!("CLOSE from {}", addr);
               return;
-            }
-            let server = servers.get(idx).expect("invalid server index");
-            if server.online.load(Ordering::Relaxed) != true {
-              println!("Selected server is offline");
-              return;
-            }
-            println!("{:2} connections | [{}] Routed {}:{} to server {} ({})", threads, routing, host, port, idx, server.hostname);
-            let mut tunnel = if idx == 0 {
-              match TcpStream::connect((&*host, port)) {
-                Ok(tunnel) => {
-                  stream.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00").unwrap();
-                  tunnel
-                },
-                Err(err) => {
-                  match err.kind() {
-                    ErrorKind::ConnectionRefused => { stream.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00").unwrap(); },
-                    _ => { stream.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00").unwrap(); }
-                  }
-                  return;
-                }
-              }
-            }
-            else { TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port") };
-            tunnel.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
-            tunnel.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
-            let mut buf: [u8; 1500] = [0; 1500];
-            if idx != 0 {
-              let _ = tunnel.write(b"\x05\x01\x00").unwrap();
-              let _ = tunnel.read(&mut buf).unwrap(); // TODO: check the SOCKS5 response here
-              let _ = tunnel.write(&req[0..c]).unwrap();
-            }
-            let mut tunnel_read = tunnel.try_clone().expect("Failed to clone tunnel TcpStream");
-            let mut stream_write = stream.try_clone().expect("Failed to clone client TcpStream");
-            let inbound = thread::spawn(move || {
-              let mut buf: [u8; 1500] = [0; 1500];
-              let mut count = 0;
-              loop {
-                match tunnel_read.read(&mut buf) {
-                  Ok(c) => {
-                    if c == 0 { return count; }
-                    count += c;
-                    if let Err(_) = stream_write.write_all(&buf[0..c]) {
-                      println!("Write error on client");
-                      return 0;
-                    }
-                  }
-                  Err(_) => {
-                    println!("Read error on tunnel");
-                    return 0;
-                  }
-                }
-              }
-            });
-            let mut count = 0;
-            loop {
-              match stream.read(&mut buf) {
-                Ok(c) => {
-                  if c == 0 { break; }
-                  count += c;
-                  if let Err(_) = tunnel.write_all(&buf[0..c]) {
-                    println!("Write error on tunnel");
-                    return;
-                  }
-                }
-                Err(_) => {
-                  println!("Read error on client");
-                  return;
-                }
-              }
-            }
-            match inbound.join() {
-              Ok(c) => {},//println!("Host {} port {} finished with {}b headers {}b data {}s duration", host, port, count, c, start.elapsed().as_secs()),
-              Err(_) => println!("Host {} port {} reading thread panicked", host, port)
-            }
+            },
+            _ => bytes = c
           }
-          else {
-            println!("Invalid connection request from {}", addr);
+          Err(e) => {
+            println!("READ ERROR from {}: {}", addr, e.to_string());
             return;
           }
         }
-        Err(e) => {
-          println!("READ ERROR from {}: {}", addr, e.to_string());
+      }
+
+      let host;
+      let mut port;
+      let mut idx = 0;
+      let mut routing = "hash";
+
+      if proto == 5 {
+        if &req[0..3] != b"\x05\x01\x00" {
+          println!("Invalid SOCKS5 request from {}", addr);
           return;
         }
+        if req[3] == b'\x01' { // IPv4
+          host = format!("{}.{}.{}.{}", req[4], req[5], req[6], req[7]);
+          port = (req[8] as u16) << 8;
+          port += req[9] as u16;
+        }
+        else if req[3] == b'\x03' { // Hostname
+          let length = req[4] as usize;
+          host = String::from_utf8_lossy(&req[5..(5+length)]).into_owned();
+          port = (req[5+length] as u16) << 8;
+          port += req[5+length+1] as u16;
+        }
+        else if req[3] == b'\x04' { // IPv6
+          let mut address: [u8; 16] = Default::default();
+          address.copy_from_slice(&req[4..20]);
+          host = format!("{}", Ipv6Addr::from(address));
+          port = (req[20] as u16) << 8;
+          port += req[21] as u16;
+        }
+        else {
+          println!("Invalid SOCKS5 address request from {}", addr);
+          return;
+        }
+      }
+      else {
+        if &req[0..2] != b"\x04\x01" {
+          println!("Invalid SOCKS4 request from {}", addr);
+          return;
+        }
+        host = format!("{}.{}.{}.{}", req[4], req[5], req[6], req[7]);
+        port = (req[2] as u16) << 8;
+        port += req[3] as u16;
+      }
+
+      for rule in rules.iter() {
+        if rule.regex.is_match(&host) {
+          idx = rule.server;
+          routing = "rule";
+          break;
+        }
+      }
+      if routing != "rule" {
+        let hashhost =
+          if let Some(captures) = re.ipv4.captures(&host) { captures.get(1).unwrap().as_str() }
+          else if let Some(captures) = re.ipv6.captures(&host) { captures.get(1).unwrap().as_str() }
+          else if let Some(captures) = re.host1.captures(&host) { captures.get(1).unwrap().as_str() }
+          else if let Some(captures) = re.host2.captures(&host) { captures.get(1).unwrap().as_str() }
+          else { &host };
+        match select_server(&servers, hashhost) {
+          Ok(i) => idx = i,
+          Err(msg) => {
+            println!("{}", msg);
+            return;
+          }
+        }
+      }
+      let server = servers.get(idx).expect("invalid server index");
+      if server.online.load(Ordering::Relaxed) != true {
+        println!("Selected server is offline");
+        return;
+      }
+      println!("{:2} connections | [{}] Routed {}:{} to server {} ({})", threads, routing, host, port, idx, server.hostname);
+
+      let mut tunnel = if idx == 0 {
+        match TcpStream::connect((&*host, port)) {
+          Ok(tunnel) => {
+            if proto == 4 { stream.write(b"\x00\x5A").unwrap(); }
+            else { stream.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00").unwrap(); }
+            tunnel
+          },
+          Err(err) => {
+            if proto == 4 { stream.write(b"\x00\x5B").unwrap(); }
+            else {
+              match err.kind() {
+                ErrorKind::ConnectionRefused => { stream.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00").unwrap(); },
+                _ => { stream.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00").unwrap(); }
+              }
+            }
+            return;
+          }
+        }
+      }
+      else { TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port") };
+      tunnel.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
+      tunnel.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
+      let mut buf: [u8; 1500] = [0; 1500];
+      if idx != 0 {
+        if proto == 4 { tunnel.write(&req[0..bytes]).unwrap(); }
+        else {
+          let _ = tunnel.write(b"\x05\x01\x00").unwrap();
+          let _ = tunnel.read(&mut buf).unwrap(); // TODO: check the SOCKS5 response here
+          let _ = tunnel.write(&req[0..bytes]).unwrap();
+        }
+      }
+      let mut tunnel_read = tunnel.try_clone().expect("Failed to clone tunnel TcpStream");
+      let mut stream_write = stream.try_clone().expect("Failed to clone client TcpStream");
+
+      let inbound = thread::spawn(move || {
+        let mut buf: [u8; 1500] = [0; 1500];
+        let mut count = 0;
+        loop {
+          match tunnel_read.read(&mut buf) {
+            Ok(c) => {
+              if c == 0 { return count; }
+              count += c;
+              if let Err(_) = stream_write.write_all(&buf[0..c]) {
+                println!("Write error on client");
+                return 0;
+              }
+            }
+            Err(_) => {
+              println!("Read error on tunnel");
+              return 0;
+            }
+          }
+        }
+      });
+      let mut _outbound = 0;
+      loop {
+        match stream.read(&mut buf) {
+          Ok(c) => {
+            if c == 0 { break; }
+            _outbound += c;
+            if let Err(_) = tunnel.write_all(&buf[0..c]) {
+              println!("Write error on tunnel");
+              return;
+            }
+          }
+          Err(_) => {
+            println!("Read error on client");
+            return;
+          }
+        }
+      }
+      match inbound.join() {
+        Ok(_) => {},//println!("Host {} port {} finished with {}b headers {}b data {}s duration", host, port, _outbound, c, start.elapsed().as_secs()),
+        Err(_) => println!("Host {} port {} reading thread panicked", host, port)
       }
       THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
     });
@@ -326,6 +345,5 @@ fn select_server(servers: &Vec<Server>, host: &str) -> Result<usize, &'static st
   host.hash(&mut hasher);
   let hash = hasher.finish() as usize;
   let serverno = (hash%(servers.len()-1))+1;
-  let server = servers.get(serverno).unwrap();
   Ok(serverno)
 }
