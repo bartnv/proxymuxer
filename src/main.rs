@@ -24,6 +24,7 @@ struct App {
 
 #[derive(Clone, Debug)]
 struct Server {
+    id: usize,
     hostname: String,
     portno: i64,
     online: Arc<AtomicBool>
@@ -73,13 +74,13 @@ fn main() {
   println!("Using ssh arguments: {}", app.sshargs);
 
   let mut servers: Vec<Server> = Vec::new();
-  servers.push(Server { hostname: "direct".to_owned(), portno: 0, online: Arc::new(AtomicBool::new(true)) });
+  servers.push(Server { id: 0, hostname: "direct".to_owned(), portno: 0, online: Arc::new(AtomicBool::new(true)) });
 
   let mut count = 0;
   for entry in config["servers"].as_vec().expect("Invalid 'servers' setting in config.yml") {
     count += 1;
     let hostname = entry.as_str().expect("Invalid entry in 'servers' setting in config.yml").to_owned();
-    let server = Server { hostname: hostname, portno: app.startport, online: Arc::new(AtomicBool::new(false)) };
+    let server = Server { id: count, hostname: hostname, portno: app.startport, online: Arc::new(AtomicBool::new(false)) };
     servers.push(server.clone());
     let argstring = app.sshargs.clone();
     app.startport += 1;
@@ -112,6 +113,20 @@ fn main() {
   }
   let servers = servers; // Make immutable
 
+  let pool = match config["pool"].as_vec() {
+    Some(array) => {
+      let mut v = Vec::new();
+      for entry in array { v.push(entry.as_i64().unwrap() as usize); }
+      v
+    }
+    None => {
+      let mut v = Vec::new();
+      for server in &servers { v.push(server.id); };
+      v
+    }
+  };
+  println!("Set hash-based random pool to {:?}", pool);
+
   let mut rules = Vec::new();
   for (rule, server) in config["rules"].as_hash().expect("Invalid 'rules' setting in config.yml") {
     let rule = rule.as_str().expect("Invalid key in 'rules' setting in config.yml").to_owned();
@@ -129,6 +144,7 @@ fn main() {
     stream.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
     let addr = stream.peer_addr().unwrap();
     let servers = servers.clone();
+    let pool = pool.clone();
     let re = re.clone();
     let rules = rules.clone();
     thread::spawn(move || {
@@ -245,7 +261,7 @@ fn main() {
           else if let Some(captures) = re.host1.captures(&host) { captures.get(1).unwrap().as_str() }
           else if let Some(captures) = re.host2.captures(&host) { captures.get(1).unwrap().as_str() }
           else { &host };
-        match select_server(&servers, hashhost) {
+        match select_server(&pool, hashhost) {
           Ok(i) => idx = i,
           Err(msg) => {
             println!("{}", msg);
@@ -340,10 +356,10 @@ fn main() {
   }
 }
 
-fn select_server(servers: &Vec<Server>, host: &str) -> Result<usize, &'static str> {
+fn select_server(pool: &Vec<usize>, host: &str) -> Result<usize, &'static str> {
   let mut hasher = DefaultHasher::new();
   host.hash(&mut hasher);
   let hash = hasher.finish() as usize;
-  let serverno = (hash%(servers.len()-1))+1;
+  let serverno = pool[hash%pool.len()];
   Ok(serverno)
 }
