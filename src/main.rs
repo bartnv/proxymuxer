@@ -1,5 +1,6 @@
 extern crate yaml_rust;
 extern crate regex;
+extern crate prctl;
 
 use std::fs::File;
 use std::io::{Read, Write, ErrorKind};
@@ -86,6 +87,7 @@ fn main() {
     app.startport += 1;
     println!("Added server {}: {}", count, server.hostname);
     thread::spawn(move || {
+      prctl::set_name(&format!("Server {}", server.id)).expect("Failed to set process name");
       let recon_delay = Duration::new(60, 0);
       thread::sleep(Duration::new(1, 0));
       loop {
@@ -251,6 +253,7 @@ fn main() {
         if rule.regex.is_match(&host) {
           idx = rule.server;
           routing = "rule";
+          prctl::set_name(&format!("Rule {}", rule.rule)).expect("Failed to set process name");
           break;
         }
       }
@@ -261,6 +264,7 @@ fn main() {
           else if let Some(captures) = re.host1.captures(&host) { captures.get(1).unwrap().as_str() }
           else if let Some(captures) = re.host2.captures(&host) { captures.get(1).unwrap().as_str() }
           else { &host };
+        prctl::set_name(&format!("Hash {}", hashhost)).expect("Failed to set process name");
         match select_server(&pool, hashhost) {
           Ok(i) => idx = i,
           Err(msg) => {
@@ -313,6 +317,7 @@ fn main() {
       let inbound = thread::spawn(move || {
         let mut buf: [u8; 1500] = [0; 1500];
         let mut count = 0;
+        prctl::set_name("Reader").expect("Failed to set process name");
         loop {
           match tunnel_read.read(&mut buf) {
             Ok(c) => {

@@ -6,3 +6,4 @@ authors = ["Bart Noordervliet <bart@mmvi.nl>"]
 [dependencies]
 yaml-rust = "0.3.5"
 regex = "0.2"
+prctl = "1.0.0"
