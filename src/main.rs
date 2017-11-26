@@ -3,7 +3,7 @@ extern crate regex;
 extern crate prctl;
 
 use std::fs::File;
-use std::io::{Read, Write, ErrorKind};
+use std::io::{Read, Write, ErrorKind, stdout};
 use std::net::{TcpListener, TcpStream, Ipv6Addr};
 use std::time::{Duration, Instant};
 use std::thread;
@@ -150,7 +150,7 @@ fn main() {
     let re = re.clone();
     let rules = rules.clone();
     thread::spawn(move || {
-      let threads = THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+      let mut threads = THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
       let _start = Instant::now();
       let proto;
       let mut bytes = 0;
@@ -278,7 +278,7 @@ fn main() {
         println!("Selected server is offline");
         return;
       }
-      println!("{:2} connections | [{}] Routed {}:{} to server {} ({})", threads, routing, host, port, idx, server.hostname);
+      println!("\r{:3} connections | [{}] Routed {}:{} to server {} ({})", threads, routing, host, port, idx, server.hostname);
 
       let mut tunnel = if idx == 0 {
         match TcpStream::connect((&*host, port)) {
@@ -323,14 +323,14 @@ fn main() {
             Ok(c) => {
               if c == 0 { return count; }
               count += c;
-              if let Err(_) = stream_write.write_all(&buf[0..c]) {
-                println!("Write error on client");
-                return 0;
+              if let Err(e) = stream_write.write_all(&buf[0..c]) {
+                println!("Write error on client: {:?}", e);
+                return count;
               }
             }
-            Err(_) => {
-              println!("Read error on tunnel");
-              return 0;
+            Err(e) => {
+              println!("Read error on tunnel: {:?}", e);
+              return count;
             }
           }
         }
@@ -341,14 +341,14 @@ fn main() {
           Ok(c) => {
             if c == 0 { break; }
             _outbound += c;
-            if let Err(_) = tunnel.write_all(&buf[0..c]) {
-              println!("Write error on tunnel");
-              return;
+            if let Err(e) = tunnel.write_all(&buf[0..c]) {
+              println!("Write error on tunnel: {:?}", e);
+              break;
             }
           }
-          Err(_) => {
-            println!("Read error on client");
-            return;
+          Err(e) => {
+            println!("Read error on client: {:?}", e);
+            break;
           }
         }
       }
@@ -356,7 +356,9 @@ fn main() {
         Ok(_) => {},//println!("Host {} port {} finished with {}b headers {}b data {}s duration", host, port, _outbound, c, start.elapsed().as_secs()),
         Err(_) => println!("Host {} port {} reading thread panicked", host, port)
       }
-      THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
+      threads = THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
+      print!("\r{:3} connections | ", threads-1);
+      stdout().flush().unwrap();
     });
   }
 }
