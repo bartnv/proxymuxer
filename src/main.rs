@@ -48,10 +48,18 @@ static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
 
 fn main() {
   let mut app = App { listenport: 8080, startport: 61234, sshargs: String::from("-N") };
-  let mut file = File::open("config.yml").unwrap();
+  let mut file = File::open("config.yml").expect("Failed to read configuration file: config.yml");
   let mut config_str = String::new();
-  file.read_to_string(&mut config_str).unwrap();
-  let docs = YamlLoader::load_from_str(&config_str).unwrap();
+  file.read_to_string(&mut config_str).expect("Configuration file contains invalid UTF8");
+  let docs;
+  match YamlLoader::load_from_str(&config_str) {
+      Ok(r) => docs = r,
+      Err(e) => {
+          println!("Configuration file contains invalid YAML:");
+          println!("{:?}", e);
+          return;
+      }
+  }
   let config = &docs[0];
   let io_timeout = Duration::new(300, 0); // 5 minutes
   let re = Arc::new(Matches {
@@ -139,7 +147,7 @@ fn main() {
   }
   let rules = Arc::new(rules); // RefCount and make immutable
 
-  let server = TcpListener::bind(("0.0.0.0", app.listenport as u16)).unwrap();
+  let server = TcpListener::bind(("0.0.0.0", app.listenport as u16)).expect("Failed to bind to listen port");
   for client in server.incoming() {
     let mut stream = client.unwrap();
     stream.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
