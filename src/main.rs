@@ -321,6 +321,8 @@ fn main() {
       }
       let mut tunnel_read = tunnel.try_clone().expect("Failed to clone tunnel TcpStream");
       let mut stream_write = stream.try_clone().expect("Failed to clone client TcpStream");
+      let thr_host = host.clone();
+      let thr_serv = server.hostname.clone();
 
       let inbound = thread::spawn(move || {
         let mut buf: [u8; 1500] = [0; 1500];
@@ -332,12 +334,12 @@ fn main() {
               if c == 0 { return count; }
               count += c;
               if let Err(e) = stream_write.write_all(&buf[0..c]) {
-                println!("Write error on client: {:?}", e);
+                println!("\r[{}/{}] Write error on client: {:?}", thr_serv, thr_host, e);
                 return count;
               }
             }
             Err(e) => {
-              println!("Read error on tunnel: {:?}", e);
+              println!("\r[{}/{}] Read error on tunnel: {:?}", thr_serv, thr_host, e);
               return count;
             }
           }
@@ -350,12 +352,12 @@ fn main() {
             if c == 0 { break; }
             _outbound += c;
             if let Err(e) = tunnel.write_all(&buf[0..c]) {
-              println!("Write error on tunnel: {:?}", e);
+              println!("\r[{}/{}] Write error on tunnel: {:?}", server.hostname, host, e);
               break;
             }
           }
           Err(e) => {
-            println!("Read error on client: {:?}", e);
+            println!("\r[{}/{}] Read error on client: {:?}", server.hostname, host, e);
             break;
           }
         }
