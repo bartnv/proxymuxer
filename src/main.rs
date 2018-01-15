@@ -339,7 +339,11 @@ fn main() {
               }
             }
             Err(e) => {
-              println!("\r[{}/{}] Read error on tunnel: {:?}", thr_serv, thr_host, e);
+              if e.kind() == ErrorKind::WouldBlock {
+                thread::yield_now();
+                continue;
+              }
+              println!("\r[{}/{}] Read error on tunnel: {:?} {:?}", thr_serv, thr_host, e, e.kind());
               return count;
             }
           }
@@ -357,7 +361,11 @@ fn main() {
             }
           }
           Err(e) => {
-            println!("\r[{}/{}] Read error on client: {:?}", server.hostname, host, e);
+            if e.kind() == ErrorKind::WouldBlock {
+              thread::yield_now();
+              continue;
+            }
+            println!("\r[{}/{}] Read error on client: {:?} {:?}", server.hostname, host, e, e.kind());
             break;
           }
         }
