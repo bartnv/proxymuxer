@@ -149,7 +149,13 @@ fn main() {
 
   let server = TcpListener::bind(("0.0.0.0", app.listenport as u16)).expect("Failed to bind to listen port");
   for client in server.incoming() {
-    let mut stream = client.unwrap();
+    let mut stream = match client {
+      Ok(stream) => stream,
+      Err(err) => {
+        println!("Failed to accept connection: {:?}", err);
+        continue;
+      }
+    };
     stream.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
     stream.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
     let addr = stream.peer_addr().unwrap();
