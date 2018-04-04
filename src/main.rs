@@ -61,7 +61,8 @@ fn main() {
       }
   }
   let config = &docs[0];
-  let io_timeout = Duration::new(300, 0); // 5 minutes
+  let connect_timeout = Duration::new(10, 0); // 10 seconds
+  let idle_timeout = Duration::new(300, 0); // 5 minutes
   let re = Arc::new(Matches {
     ipv4: Regex::new(r"^(\d{1,3}\.\d{1,3})\.\d{1,3}\.\d{1,3}$").unwrap(),
     ipv6: Regex::new(r"^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+):").unwrap(),
@@ -156,8 +157,8 @@ fn main() {
         continue;
       }
     };
-    stream.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
-    stream.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
+    stream.set_read_timeout(Some(connect_timeout)).expect("Failed to set read timeout on TcpStream");
+    stream.set_write_timeout(Some(connect_timeout)).expect("Failed to set write timeout on TcpStream");
     let addr = match stream.peer_addr() {
       Ok(addr) => addr,
       Err(e) => {
@@ -328,8 +329,8 @@ fn main() {
         }
       }
       else { TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port") }; // TODO: report error back to client here too
-      tunnel.set_read_timeout(Some(io_timeout)).expect("Failed to set read timeout on TcpStream");
-      tunnel.set_write_timeout(Some(io_timeout)).expect("Failed to set write timeout on TcpStream");
+      tunnel.set_read_timeout(Some(connect_timeout)).expect("Failed to set read timeout on TcpStream");
+      tunnel.set_write_timeout(Some(connect_timeout)).expect("Failed to set write timeout on TcpStream");
       let mut buf: [u8; 1500] = [0; 1500];
       if idx != 0 {
         if proto == 4 { tunnel.write(&req[0..bytes]).expect("Failed to write SOCKS4 request to tunnel"); }
@@ -352,6 +353,7 @@ fn main() {
           match tunnel_read.read(&mut buf) {
             Ok(c) => {
               if c == 0 { return count; }
+              if count == 0 { let _ = tunnel_read.set_read_timeout(Some(idle_timeout)).expect("Failed to set read timeout on TcpStream"); }
               count += c;
               if let Err(e) = stream_write.write_all(&buf[0..c]) {
                 println!("\r[{}/{}] Write error on client: {}", thr_serv, thr_host, e.to_string());
@@ -359,7 +361,7 @@ fn main() {
               }
             }
             Err(e) => {
-              if e.kind() == ErrorKind::WouldBlock { println!("\r[{}/{}] Read timeout on tunnel", thr_serv, thr_host); }
+              if e.kind() == ErrorKind::WouldBlock { println!("\r[{}/{}] Read timeout on tunnel ({} bytes read)", thr_serv, thr_host, count); }
               else { println!("\r[{}/{}] Read error on tunnel: {}", thr_serv, thr_host, e.to_string()); }
               let _ = stream_write.shutdown(std::net::Shutdown::Both);
               return count;
@@ -367,12 +369,13 @@ fn main() {
           }
         }
       });
-      let mut _outbound = 0;
+      let mut outbound = 0;
       loop {
         match stream.read(&mut buf) {
           Ok(c) => {
             if c == 0 { break; }
-            _outbound += c;
+            if outbound == 0 { let _ = stream.set_read_timeout(Some(idle_timeout)).expect("Failed to set read timeout on TcpStream"); }
+            outbound += c;
             // println!("\rHost {} port {} outbound {} duration {}s", host, port, _outbound, _start.elapsed().as_secs());
             if let Err(e) = tunnel.write_all(&buf[0..c]) {
               println!("\r[{}/{}] Write error on tunnel: {}", server.hostname, host, e.to_string());
@@ -380,7 +383,7 @@ fn main() {
             }
           }
           Err(e) => {
-            if e.kind() == ErrorKind::WouldBlock { println!("\r[{}/{}] Read timeout on client", server.hostname, host); }
+            if e.kind() == ErrorKind::WouldBlock { println!("\r[{}/{}] Read timeout on client ({} bytes read)", server.hostname, host, outbound); }
             else { println!("\r[{}/{}] Read error on client: {}", server.hostname, host, e.to_string()); }
             let _ = tunnel.shutdown(std::net::Shutdown::Both);
             break;
@@ -388,7 +391,7 @@ fn main() {
         }
       }
       match inbound.join() {
-        Ok(_) => {},//println!("\rHost {} port {} finished with {}b headers {}b data {}s duration", host, port, _outbound, c, _start.elapsed().as_secs()),
+        Ok(_) => {},//println!("\rHost {} port {} finished with {}b headers {}b data {}s duration", host, port, outbound, c, _start.elapsed().as_secs()),
         Err(_) => println!("\rHost {} port {} reading thread panicked", host, port)
       }
       cleanup();
