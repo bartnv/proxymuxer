@@ -299,12 +299,29 @@ fn main() {
           }
         }
       }
-      let server = servers.get(idx).expect("Invalid server index");
+      let mut server = servers.get(idx).expect("Invalid server index");
       if server.online.load(Ordering::Relaxed) != true {
-        println!("Selected server is offline");
-        cleanup();
-        return;
+        if routing == "rule" {
+          println!("Rule directed server is offline");
+          cleanup();
+          return;
+        }
+        let i = 0;
+        let result = loop {
+          if i == pool.len() { break None; }
+          let server = servers.get(pool[i]).expect("Invalid server index in pool");
+          if server.online.load(Ordering::Relaxed) == true { break Some(server); }
+        };
+        match result {
+          Some(res) => { server = res; }
+          None => {
+            println!("No online server found in pool");
+            cleanup();
+            return;
+          }
+        }
       }
+      let server = server;
       println!("\r{:3} connections | [{}] Routed {}:{} to server {} ({})", threads, routing, host, port, idx, server.hostname);
 
       let mut tunnel = if idx == 0 {
