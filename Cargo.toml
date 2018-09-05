@@ -5,5 +5,5 @@ authors = ["Bart Noordervliet <bart@mmvi.nl>"]
 
 [dependencies]
 yaml-rust = "0.4"
-regex = "0.2"
+regex = "1"
 prctl = "1"
