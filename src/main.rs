@@ -468,7 +468,7 @@ fn main() {
 
       cleanup();
 
-      println!("Connection to {}:{} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data", connection.hostname, connection.portno, connection.start.elapsed().as_secs(), connection.inbound, connection.outbound, connection.conn_ms, connection.data_ms);
+      println!("Connection to {}:{} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data", connection.hostname, connection.portno, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms);
     });
 
     if info_last.elapsed() > Duration::new(900, 0) {
