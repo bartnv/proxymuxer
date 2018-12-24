@@ -2,21 +2,19 @@ extern crate yaml_rust;
 extern crate regex;
 extern crate prctl;
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, ErrorKind, stdout};
 use std::net::{TcpListener, TcpStream, SocketAddr, Ipv6Addr};
 use std::time::{Duration, Instant};
 use std::thread;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, ATOMIC_USIZE_INIT};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{Ordering, AtomicBool, AtomicUsize, ATOMIC_USIZE_INIT};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use yaml_rust::YamlLoader;
 use regex::Regex;
 
-#[derive(Clone)]
 struct App {
   listenport: i64,
   startport: i64,
@@ -78,6 +76,7 @@ fn main() {
   let mut app = App { listenport: 8080, startport: 61234, sshargs: String::from("-N") };
   let mut file = File::open("config.yml").expect("Failed to read configuration file: config.yml");
   let mut config_str = String::new();
+  let connectionlog: String;
   file.read_to_string(&mut config_str).expect("Configuration file contains invalid UTF8");
   let docs;
   match YamlLoader::load_from_str(&config_str) {
@@ -110,6 +109,11 @@ fn main() {
     app.sshargs = String::from(config["sshargs"].as_str().expect("Invalid 'sshargs' setting in config.yml"));
   }
   println!("Using ssh arguments: {}", app.sshargs);
+  if !config["connectionlog"].is_badvalue() {
+    connectionlog = config["connectionlog"].as_str().expect("Invalid 'connectionlog' setting in config.yml").to_string();
+    println!("Writing connection log to {}", connectionlog);
+  }
+  else { connectionlog = String::new(); }
 
   let mut servers: Vec<Server> = Vec::new();
   {
@@ -132,7 +136,7 @@ fn main() {
       let recon_delay = Duration::new(60, 0);
       thread::sleep(Duration::new(1, 0));
       loop {
-        println!("Connecting to {} with listen port {}", server.hostname, server.portno);
+        println!("\rConnecting to {} with listen port {}", server.hostname, server.portno);
         let argvec: Vec<&str> = argstring.split_whitespace().collect();
         let mut child = Command::new("ssh")
                                 .arg("-D")
@@ -153,7 +157,7 @@ fn main() {
                 None => println!("Ssh session for {} was killed by a signal", server.hostname)
             }
         }
-        println!("Waiting {} seconds before reconnecting...", recon_delay.as_secs());
+        println!("\rWaiting {} seconds before reconnecting...", recon_delay.as_secs());
         thread::sleep(recon_delay);
       }
     });
@@ -205,6 +209,7 @@ fn main() {
     let pool = pool.clone();
     let re = re.clone();
     let rules = rules.clone();
+    let connectionlog = connectionlog.clone();
     thread::spawn(move || { // connection thread
       let threads = THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
       let mut bytes = 0;
@@ -337,11 +342,12 @@ fn main() {
           cleanup();
           return;
         }
-        let i = 0;
+        let mut i = 0;
         let result = loop {
           if i == pool.len() { break None; }
           let server = thr_servers.get(pool[i]).expect("Invalid server index in pool");
           if server.online.load(Ordering::Relaxed) == true { break Some(server); }
+          i += 1;
         };
         match result {
           Some(res) => { server = res; }
@@ -392,6 +398,7 @@ fn main() {
       let mut stream_write = stream.try_clone().expect("Failed to clone client TcpStream");
       let thr_conn = connection.clone();
       let thr_serv = server.clone();
+      let thr_log = connectionlog.clone();
 
       let inbound = thread::spawn(move || { // inbound data thread
         let mut buf: [u8; 1500] = [0; 1500];
@@ -468,7 +475,11 @@ fn main() {
 
       cleanup();
 
-      println!("Connection to {}:{} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data", connection.hostname, connection.portno, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms);
+      if !thr_log.is_empty() {
+        let mut file = OpenOptions::new().append(true).create(true).open(thr_log).expect("Failed to open connection log file");
+        writeln!(file, "Connection to {}:{} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data", connection.hostname, connection.portno, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms).unwrap();
+        file.sync_data().unwrap();
+      }
     });
 
     if info_last.elapsed() > Duration::new(900, 0) {
