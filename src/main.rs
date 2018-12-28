@@ -15,10 +15,12 @@ use std::hash::{Hash, Hasher};
 use yaml_rust::YamlLoader;
 use regex::Regex;
 
+#[derive(Clone)]
 struct App {
   listenport: i64,
   startport: i64,
-  sshargs: String
+  sshargs: String,
+  connlog: String
 }
 
 #[derive(Clone, Debug)]
@@ -73,10 +75,9 @@ struct Rule {
 static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
 
 fn main() {
-  let mut app = App { listenport: 8080, startport: 61234, sshargs: String::from("-N") };
+  let mut app = App { listenport: 8080, startport: 61234, sshargs: String::from("-N"), connlog: String::new() };
   let mut file = File::open("config.yml").expect("Failed to read configuration file: config.yml");
   let mut config_str = String::new();
-  let connectionlog: String;
   file.read_to_string(&mut config_str).expect("Configuration file contains invalid UTF8");
   let docs;
   match YamlLoader::load_from_str(&config_str) {
@@ -110,10 +111,9 @@ fn main() {
   }
   println!("Using ssh arguments: {}", app.sshargs);
   if !config["connectionlog"].is_badvalue() {
-    connectionlog = config["connectionlog"].as_str().expect("Invalid 'connectionlog' setting in config.yml").to_string();
-    println!("Writing connection log to {}", connectionlog);
+    app.connlog = config["connectionlog"].as_str().expect("Invalid 'connectionlog' setting in config.yml").to_string();
+    if !app.connlog.is_empty() { println!("Writing connection log to {}", app.connlog); }
   }
-  else { connectionlog = String::new(); }
 
   let mut servers: Vec<Server> = Vec::new();
   {
@@ -209,7 +209,8 @@ fn main() {
     let pool = pool.clone();
     let re = re.clone();
     let rules = rules.clone();
-    let connectionlog = connectionlog.clone();
+    let app = app.clone();
+
     thread::spawn(move || { // connection thread
       let threads = THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
       let mut bytes = 0;
@@ -398,7 +399,6 @@ fn main() {
       let mut stream_write = stream.try_clone().expect("Failed to clone client TcpStream");
       let thr_conn = connection.clone();
       let thr_serv = server.clone();
-      let thr_log = connectionlog.clone();
 
       let inbound = thread::spawn(move || { // inbound data thread
         let mut buf: [u8; 1500] = [0; 1500];
@@ -477,10 +477,11 @@ fn main() {
 
       cleanup();
 
-      if !thr_log.is_empty() {
-        let mut file = OpenOptions::new().append(true).create(true).open(thr_log).expect("Failed to open connection log file");
-        writeln!(file, "Connection to {}:{} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data", connection.hostname, connection.portno, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms).unwrap();
-        file.sync_data().unwrap();
+      if !app.connlog.is_empty() {
+        let mut file = OpenOptions::new().append(true).create(true).open(&app.connlog).expect("Failed to open connection log file");
+        let mut line = Vec::new();
+        writeln!(line, "Connection to {}:{} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data", connection.hostname, connection.portno, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms).unwrap();
+        file.write(&line).expect("\rFailed to write to connection log");
       }
     });
 
