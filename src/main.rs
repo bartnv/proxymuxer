@@ -458,8 +458,10 @@ fn main() {
           }
           Err(e) => {
             if e.kind() == ErrorKind::WouldBlock { println!("\r[{}/{}] Read timeout on client ({} bytes read)", server.hostname, connection.hostname, connection.outbound); }
-            else { println!("\r[{}/{}] Read error on client: {}", server.hostname, connection.hostname, e.to_string()); }
-            let _ = tunnel.shutdown(std::net::Shutdown::Both);
+            else {
+              println!("\r[{}/{}] Read error on client: {}", server.hostname, connection.hostname, e.to_string());
+              let _ = tunnel.shutdown(std::net::Shutdown::Both);
+            }
             break;
           }
         }
