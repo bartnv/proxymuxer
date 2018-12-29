@@ -51,11 +51,12 @@ struct Connection {
   outbound: u64,
   inbound: usize,
   conn_ms: usize,
-  data_ms: usize
+  data_ms: usize,
+  errors: String
 }
 impl Connection {
   fn new(peer_addr: SocketAddr) -> Connection {
-    Connection { peer_addr, start: Instant::now(), proto: 0, hostname: String::new(), portno: 0, outbound: 0, inbound: 0, conn_ms: 0, data_ms: 0 }
+    Connection { peer_addr, start: Instant::now(), proto: 0, hostname: String::new(), portno: 0, outbound: 0, inbound: 0, conn_ms: 0, data_ms: 0, errors: String::new() }
   }
 }
 
@@ -410,7 +411,7 @@ fn main() {
         loop {
           match tunnel_read.read(&mut buf) {
             Ok(c) => {
-              if c == 0 { return (bytes, conn_ms, data_ms); }
+              if c == 0 { return (bytes, conn_ms, data_ms, ""); }
               count += 1;
               if count == 1 { // SOCKS server response
                 let _ = tunnel_read.set_read_timeout(Some(idle_timeout)).expect("Failed to set read timeout on TcpStream");
@@ -422,24 +423,29 @@ fn main() {
                 if conn_ms < thr_serv.conn_best.load(Ordering::Relaxed) { thr_serv.conn_best.store(conn_ms, Ordering::Relaxed); }
                 if buf[0] == 5 && buf[1] != 0 {
                   println!("server {} returned SOCKS5 status code {:02X}", thr_serv.hostname, buf[1]);
-                  return (0, 0, 0);
+                  return (0, 0, 0, " / server returned SOCKS5 error code");
                 }
               }
               else if count == 2 { // First data from remote host
                 data_ms = (thr_conn.start.elapsed().as_secs()*1000) as usize; // TODO: change this to use Duration::as_millis() as soon as that feature stabilizes
                 data_ms += thr_conn.start.elapsed().subsec_millis() as usize;
               }
-              bytes += c;
+              if count != 1 { bytes += c; } // Don't count the SOCKS protocol response as payload bytes
               if let Err(e) = stream_write.write_all(&buf[0..c]) {
                 println!("\r[{}/{}] Write error on client: {}", thr_serv.hostname, thr_conn.hostname, e.to_string());
-                return (bytes, conn_ms, data_ms);
+                return (bytes, conn_ms, data_ms, " / write error on client");
               }
             }
             Err(e) => {
-              if e.kind() == ErrorKind::WouldBlock { println!("\r[{}/{}] Read timeout on tunnel ({} bytes read)", thr_serv.hostname, thr_conn.hostname, bytes); }
-              else { println!("\r[{}/{}] Read error on tunnel: {}", thr_serv.hostname, thr_conn.hostname, e.to_string()); }
               let _ = stream_write.shutdown(std::net::Shutdown::Both);
-              return (bytes, conn_ms, data_ms);
+              if e.kind() == ErrorKind::WouldBlock {
+                println!("\r[{}/{}] Read timeout on tunnel ({} bytes read)", thr_serv.hostname, thr_conn.hostname, bytes);
+                return (bytes, conn_ms, data_ms, " / read timeout on tunnel");
+              }
+              else {
+                println!("\r[{}/{}] Read error on tunnel: {}", thr_serv.hostname, thr_conn.hostname, e.to_string());
+                return (bytes, conn_ms, data_ms, " / read error on tunnel");
+              }
             }
           }
         }
@@ -453,13 +459,18 @@ fn main() {
             connection.outbound += c as u64;
             if let Err(e) = tunnel.write_all(&buf[0..c]) {
               println!("\r[{}/{}] Write error on tunnel: {}", server.hostname, connection.hostname, e.to_string());
+              connection.errors.push_str(" / write error on tunnel");
               break;
             }
           }
           Err(e) => {
-            if e.kind() == ErrorKind::WouldBlock { println!("\r[{}/{}] Read timeout on client ({} bytes read)", server.hostname, connection.hostname, connection.outbound); }
+            if e.kind() == ErrorKind::WouldBlock {
+              println!("\r[{}/{}] Read timeout on client ({} bytes read)", server.hostname, connection.hostname, connection.outbound);
+              connection.errors.push_str(" / read timeout on client");
+            }
             else {
               println!("\r[{}/{}] Read error on client: {}", server.hostname, connection.hostname, e.to_string());
+              connection.errors.push_str(" / read error on client");
               let _ = tunnel.shutdown(std::net::Shutdown::Both);
             }
             break;
@@ -467,12 +478,16 @@ fn main() {
         }
       }
       match inbound.join() {
-        Ok((inbound, conn_ms, data_ms)) => {
+        Ok((inbound, conn_ms, data_ms, errors)) => {
           connection.inbound = inbound;
           connection.conn_ms = conn_ms;
           connection.data_ms = data_ms;
+          connection.errors.push_str(errors);
         },
-        Err(_) => println!("\rHost {} port {} reading thread panicked", connection.hostname, connection.portno)
+        Err(_) => {
+          println!("\rHost {} port {} reading thread panicked", connection.hostname, connection.portno);
+          connection.errors.push_str(" / reading thread panicked");
+        }
       }
 
       cleanup();
@@ -480,7 +495,7 @@ fn main() {
       if !app.connlog.is_empty() {
         let mut file = OpenOptions::new().append(true).create(true).open(&app.connlog).expect("Failed to open connection log file");
         let mut line = Vec::new();
-        writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data", connection.hostname, connection.portno, routing, server.hostname, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms).unwrap();
+        writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data{}", connection.hostname, connection.portno, routing, server.hostname, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms, connection.errors).unwrap();
         file.write(&line).expect("\rFailed to write to connection log");
       }
     });
