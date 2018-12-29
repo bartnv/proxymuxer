@@ -480,7 +480,7 @@ fn main() {
       if !app.connlog.is_empty() {
         let mut file = OpenOptions::new().append(true).create(true).open(&app.connlog).expect("Failed to open connection log file");
         let mut line = Vec::new();
-        writeln!(line, "Connection to {}:{} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data", connection.hostname, connection.portno, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms).unwrap();
+        writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data", connection.hostname, connection.portno, routing, server.hostname, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms).unwrap();
         file.write(&line).expect("\rFailed to write to connection log");
       }
     });
