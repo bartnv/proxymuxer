@@ -154,8 +154,8 @@ fn main() {
         server.online.store(false, Ordering::Relaxed);
         if !ecode.success() {
             match ecode.code() {
-                Some(code) => println!("Ssh session for {} failed with exit code {}", server.hostname, code),
-                None => println!("Ssh session for {} was killed by a signal", server.hostname)
+                Some(code) => println!("\rSsh session for {} failed with exit code {}", server.hostname, code),
+                None => println!("\rSsh session for {} was killed by a signal", server.hostname)
             }
         }
         println!("\rWaiting {} seconds before reconnecting...", recon_delay.as_secs());
@@ -195,14 +195,14 @@ fn main() {
     let mut stream = match client {
       Ok(stream) => stream,
       Err(err) => {
-        println!("Failed to accept connection: {:?}", err);
+        println!("\rFailed to accept connection: {:?}", err);
         continue;
       }
     };
     stream.set_read_timeout(Some(connect_timeout)).expect("Failed to set read timeout on TcpStream");
     stream.set_write_timeout(Some(connect_timeout)).expect("Failed to set write timeout on TcpStream");
     if stream.peer_addr().is_err() {
-      println!("Failed to get peer_addr() from stream: {}", stream.peer_addr().unwrap_err().to_string());
+      println!("\rFailed to get peer_addr() from stream: {}", stream.peer_addr().unwrap_err().to_string());
       continue;
     }
     let mut connection = Connection::new(stream.peer_addr().unwrap());
@@ -219,7 +219,7 @@ fn main() {
       match stream.read(&mut req) {
         Ok(c) => {
           if c == 0 {
-            println!("Incoming connection from {} closed before protocol exchange", connection.peer_addr);
+            println!("\rIncoming connection from {} closed before protocol exchange", connection.peer_addr);
             cleanup();
             return;
           }
@@ -228,7 +228,7 @@ fn main() {
             match stream.write(b"\x05\x00") {
               Ok(_) => {}
               Err(e) => {
-                println!("Incoming connection from {} lost during protocol exchange: {}", connection.peer_addr, e.to_string());
+                println!("\rIncoming connection from {} lost during protocol exchange: {}", connection.peer_addr, e.to_string());
                 cleanup();
                 return;
               }
@@ -239,13 +239,14 @@ fn main() {
             bytes = c;
           }
           else {
-            println!("Invalid auth request from {}", connection.peer_addr);
+            println!("\rInvalid auth request from {}: {}", connection.peer_addr, String::from_utf8_lossy(&req));
+            thread::sleep(Duration::new(5, 0)); // Some devices retry immediately, so throttle a little here
             cleanup();
             return;
           }
         }
         Err(e) => {
-          println!("Incoming connection from {} lost before protocol exchange: {}", connection.peer_addr, e.to_string());
+          println!("\rIncoming connection from {} lost before protocol exchange: {}", connection.peer_addr, e.to_string());
           cleanup();
           return;
         }
@@ -254,14 +255,14 @@ fn main() {
         match stream.read(&mut req) {
           Ok(c) => match c {
             0 => {
-              println!("Incoming connection from {} closed after protocol exchange", connection.peer_addr);
+              println!("\rIncoming connection from {} closed after protocol exchange", connection.peer_addr);
               cleanup();
               return;
             },
             _ => bytes = c
           }
           Err(e) => {
-            println!("Incoming connection from {} lost after protocol exchange: {}", connection.peer_addr, e.to_string());
+            println!("\rIncoming connection from {} lost after protocol exchange: {}", connection.peer_addr, e.to_string());
             cleanup();
             return;
           }
@@ -273,7 +274,7 @@ fn main() {
 
       if connection.proto == 5 {
         if &req[0..3] != b"\x05\x01\x00" {
-          println!("Invalid SOCKS5 request from {}", connection.peer_addr);
+          println!("\rInvalid SOCKS5 request from {}", connection.peer_addr);
           cleanup();
           return;
         }
@@ -296,14 +297,14 @@ fn main() {
           connection.portno += req[21] as u16;
         }
         else {
-          println!("Invalid SOCKS5 address request from {}", connection.peer_addr);
+          println!("\rInvalid SOCKS5 address request from {}", connection.peer_addr);
           cleanup();
           return;
         }
       }
       else {
         if &req[0..2] != b"\x04\x01" {
-          println!("Invalid SOCKS4 request from {}", connection.peer_addr);
+          println!("\rInvalid SOCKS4 request from {}", connection.peer_addr);
           cleanup();
           return;
         }
@@ -331,7 +332,7 @@ fn main() {
         match select_server(&pool, hashhost) {
           Ok(i) => idx = i,
           Err(msg) => {
-            println!("{}", msg);
+            println!("\r{}", msg);
             cleanup();
             return;
           }
@@ -371,7 +372,7 @@ fn main() {
             tunnel
           },
           Err(err) => {
-            println!("Failed to make direct connection to {}:{}", connection.hostname, connection.portno);
+            println!("\rFailed to make direct connection to {}:{}", connection.hostname, connection.portno);
             if connection.proto == 4 { stream.write(b"\x00\x5B").expect("Failed to write SOCKS4 error back to client"); }
             else {
               match err.kind() {
@@ -422,7 +423,7 @@ fn main() {
                 // TODO: use AtomicUsize::fetch_min().min() here once the feature stabilizes
                 if conn_ms < thr_serv.conn_best.load(Ordering::Relaxed) { thr_serv.conn_best.store(conn_ms, Ordering::Relaxed); }
                 if buf[0] == 5 && buf[1] != 0 {
-                  println!("server {} returned SOCKS5 status code {:02X}", thr_serv.hostname, buf[1]);
+                  println!("\rServer {} returned SOCKS5 status code {:02X}", thr_serv.hostname, buf[1]);
                   return (0, 0, 0, " / server returned SOCKS5 error code");
                 }
               }
@@ -506,7 +507,7 @@ fn main() {
           0 => 0,
           _ => server.conn_avg.load(Ordering::Relaxed)/server.conn_count.load(Ordering::Relaxed)
         };
-        println!("server {} online_secs {} connections {:#?} con_avg {:#?} con_best {:#?}", server.hostname, server.online_since.lock().unwrap().elapsed().as_secs(), server.conn_count, con_avg, if con_avg != 0 { server.conn_best.load(Ordering::Relaxed) } else { 0 });
+        println!("\rServer {} online_secs {} connections {:#?} con_avg {:#?} con_best {:#?}", server.hostname, server.online_since.lock().unwrap().elapsed().as_secs(), server.conn_count, con_avg, if con_avg != 0 { server.conn_best.load(Ordering::Relaxed) } else { 0 });
       }
       info_last = Instant::now();
     }
