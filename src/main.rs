@@ -230,7 +230,7 @@ fn main() {
             bytes = c;
           }
           else {
-            println!("\rInvalid request from {}: {}", connection.peer_addr, String::from_utf8_lossy(&req));
+            println!("\rInvalid request from {}: {}", connection.peer_addr, String::from_utf8_lossy(&req).lines().next().unwrap_or("<binary>"));
             thread::sleep(Duration::new(5, 0)); // Some devices retry immediately, so throttle a little here
           }
         }
