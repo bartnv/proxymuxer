@@ -218,20 +218,11 @@ fn main() {
       let mut req: [u8; 2048] = [0; 2048];
       match stream.read(&mut req) {
         Ok(c) => {
-          if c == 0 {
-            println!("\rIncoming connection from {} closed before protocol exchange", connection.peer_addr);
-            cleanup();
-            return;
-          }
-          if req[0] == 5 { // SOCKS5
-            connection.proto = 5;
+          if c == 0 { println!("\rIncoming connection from {} closed before protocol exchange", connection.peer_addr); }
+          else if req[0] == 5 { // SOCKS5
             match stream.write(b"\x05\x00") {
-              Ok(_) => {}
-              Err(e) => {
-                println!("\rIncoming connection from {} lost during protocol exchange: {}", connection.peer_addr, e.to_string());
-                cleanup();
-                return;
-              }
+              Ok(_) => { connection.proto = 5; },
+              Err(e) => { println!("\rIncoming connection from {} lost during protocol exchange: {}", connection.peer_addr, e.to_string()); }
             }
           }
           else if req[0] == 4 { // SOCKS4
@@ -239,18 +230,14 @@ fn main() {
             bytes = c;
           }
           else {
-            println!("\rInvalid auth request from {}: {}", connection.peer_addr, String::from_utf8_lossy(&req));
+            println!("\rInvalid request from {}: {}", connection.peer_addr, String::from_utf8_lossy(&req));
             thread::sleep(Duration::new(5, 0)); // Some devices retry immediately, so throttle a little here
-            cleanup();
-            return;
           }
         }
-        Err(e) => {
-          println!("\rIncoming connection from {} lost before protocol exchange: {}", connection.peer_addr, e.to_string());
-          cleanup();
-          return;
-        }
+        Err(e) => { println!("\rIncoming connection from {} lost before protocol exchange: {}", connection.peer_addr, e.to_string()); }
       }
+      if connection.proto == 0 { cleanup(); return; } // Protocol negotiation failed
+
       if connection.proto == 5 {
         match stream.read(&mut req) {
           Ok(c) => match c {
