@@ -399,7 +399,10 @@ fn main() {
         loop {
           match tunnel_read.read(&mut buf) {
             Ok(c) => {
-              if c == 0 { return (bytes, conn_ms, data_ms, ""); }
+              if c == 0 {
+                let _ = stream_write.shutdown(std::net::Shutdown::Both);
+                return (bytes, conn_ms, data_ms, "");
+              }
               count += 1;
               if count == 1 { // SOCKS server response
                 let _ = tunnel_read.set_read_timeout(Some(idle_timeout)).expect("Failed to set read timeout on TcpStream");
