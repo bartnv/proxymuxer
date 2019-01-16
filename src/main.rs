@@ -40,6 +40,11 @@ impl Server {
   fn new(id: usize, hostname: String, portno: i64) -> Server {
     Server { id, hostname, portno, online: Arc::new(AtomicBool::new(false)), online_since: Arc::new(RwLock::new(Instant::now())), responsive: Arc::new(AtomicBool::new(true)), conn_count: Arc::new(ATOMIC_USIZE_INIT), conn_avg: Arc::new(ATOMIC_USIZE_INIT), conn_best: Arc::new(AtomicUsize::new(usize::max_value())), errors: Arc::new(RwLock::new(vec![false; 10])) }
   }
+  fn push_status(&self, is_error: bool) {
+    let mut errors = self.errors.write().unwrap();
+    errors.remove(0);
+    errors.push(is_error);
+  }
 }
 
 #[derive(Clone, Debug)]
@@ -495,12 +500,8 @@ fn main() {
         }
       }
 
-      {
-        let mut errors = server.errors.write().unwrap();
-        errors.remove(0);
-        errors.push(if connection.errors.contains("tunnel") { true } else { false });
-      }
-      cleanup();
+      server.push_status(connection.errors.contains("tunnel"));
+      cleanup("");
 
       if !app.connlog.is_empty() {
         let mut file = OpenOptions::new().append(true).create(true).open(&app.connlog).expect("Failed to open connection log file");
