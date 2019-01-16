@@ -548,10 +548,7 @@ fn main() {
       loop {
         match stream.read(&mut buf) {
           Ok(c) => {
-            if c == 0 {
-              if connection.outbound == 0 { connection.errors.push_str(" / no requests"); }
-              break;
-            }
+            if c == 0 { break; }
             if connection.outbound == 0 { stream.set_read_timeout(Some(app.idletimeout)).expect("Failed to set read timeout on TcpStream"); }
             connection.outbound += c as u64;
             if let Err(e) = tunnel.write_all(&buf[0..c]) {
@@ -566,7 +563,6 @@ fn main() {
                 println!("\r[{}/{}] Read timeout on client ({} bytes read)", server.hostname, connection.hostname, connection.outbound);
                 connection.errors.push_str(" / read timeout on client");
               }
-              else { connection.errors.push_str(" / no requests"); }
             }
             else {
               println!("\r[{}/{}] Read error on client: {}", server.hostname, connection.hostname, e.to_string());
@@ -582,7 +578,7 @@ fn main() {
           connection.inbound = inbound;
           connection.conn_ms = conn_ms;
           connection.data_ms = data_ms;
-          if connection.errors != " / no requests" { connection.errors.push_str(errors); }
+          connection.errors.push_str(errors);
         },
         Err(_) => {
           println!("\rHost {} port {} reading thread panicked", connection.hostname, connection.portno);
@@ -596,7 +592,8 @@ fn main() {
       if !app.connlog.is_empty() {
         let mut file = OpenOptions::new().append(true).create(true).open(&app.connlog).expect("Failed to open connection log file");
         let mut line = Vec::new();
-        writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data{}", connection.hostname, connection.portno, routing, server.hostname, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms, connection.errors).unwrap();
+        if connection.outbound == 0 { writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s without requests", connection.hostname, connection.portno, routing, server.hostname, connection.start.elapsed().as_secs()).unwrap(); }
+        else { writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data{}", connection.hostname, connection.portno, routing, server.hostname, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms, connection.errors).unwrap(); }
         file.write_all(&line).expect("\rFailed to write to connection log");
       }
     });
