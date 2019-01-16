@@ -150,7 +150,7 @@ fn main() {
                                 .arg(format!("localhost:{}", server.portno))
                                 .args(argvec)
                                 .arg(server.hostname.clone())
-                                .spawn().expect(&format!("Failed to launch ssh session to {}", server.hostname));
+                                .spawn().unwrap_or_else(|_| panic!("Failed to launch ssh session to {}", server.hostname));
         server.online.store(true, Ordering::Relaxed);
         {
           let mut instant = server.online_since.write().unwrap();
@@ -191,7 +191,7 @@ fn main() {
     let server = server.as_i64().expect("Invalid value in 'rules' setting in config.yml") as usize;
     let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
     println!("Added rule {} for server {}", &rule, &server);
-    rules.push(Rule { rule: rule, regex: Regex::new(&pattern).unwrap(), server: server });
+    rules.push(Rule { rule, regex: Regex::new(&pattern).unwrap(), server });
   }
   let rules = Arc::new(rules); // RefCount and make immutable
 
@@ -227,8 +227,9 @@ fn main() {
           if c == 0 { println!("\rIncoming connection from {} closed before protocol exchange", connection.peer_addr); }
           else if req[0] == 5 { // SOCKS5
             match stream.write(b"\x05\x00") {
-              Ok(_) => { connection.proto = 5; },
-              Err(e) => { println!("\rIncoming connection from {} lost during protocol exchange: {}", connection.peer_addr, e.to_string()); }
+              Ok(2) => { connection.proto = 5; },
+              Err(e) => { println!("\rIncoming connection from {} lost during protocol exchange: {}", connection.peer_addr, e.to_string()); },
+              _ => { println!("\rIncoming connection from {} lost during protocol exchange", connection.peer_addr); }
             }
           }
           else if req[0] == 4 { // SOCKS4
@@ -242,21 +243,13 @@ fn main() {
         }
         Err(e) => { println!("\rIncoming connection from {} lost before protocol exchange: {}", connection.peer_addr, e.to_string()); }
       }
-      if connection.proto == 0 { cleanup(); return; } // Protocol negotiation failed
+      if connection.proto == 0 { cleanup(""); return; } // Protocol negotiation failed
 
       if connection.proto == 5 {
         match stream.read(&mut req) {
-          Ok(c) => match c {
-            0 => {
-              println!("\rIncoming connection from {} closed after protocol exchange", connection.peer_addr);
-              cleanup();
-              return;
-            },
-            _ => bytes = c
-          }
-          Err(e) => {
-            println!("\rIncoming connection from {} lost after protocol exchange: {}", connection.peer_addr, e.to_string());
-            cleanup();
+          Ok(c) if c > 0 => { bytes = c },
+          _ => {
+            cleanup(&format!("Incoming connection from {} closed after protocol exchange", connection.peer_addr));
             return;
           }
         }
@@ -267,43 +260,40 @@ fn main() {
 
       if connection.proto == 5 {
         if &req[0..3] != b"\x05\x01\x00" {
-          println!("\rInvalid SOCKS5 request from {}", connection.peer_addr);
-          cleanup();
+          cleanup(&format!("Invalid SOCKS5 request from {}", connection.peer_addr));
           return;
         }
         if req[3] == b'\x01' { // IPv4
           connection.hostname = format!("{}.{}.{}.{}", req[4], req[5], req[6], req[7]);
-          connection.portno = (req[8] as u16) << 8;
-          connection.portno += req[9] as u16;
+          connection.portno = u16::from(req[8]) << 8;
+          connection.portno += u16::from(req[9]);
         }
         else if req[3] == b'\x03' { // Hostname
           let length = req[4] as usize;
           connection.hostname = String::from_utf8_lossy(&req[5..(5+length)]).into_owned();
-          connection.portno = (req[5+length] as u16) << 8;
-          connection.portno += req[5+length+1] as u16;
+          connection.portno = u16::from(req[5+length]) << 8;
+          connection.portno += u16::from(req[5+length+1]);
         }
         else if req[3] == b'\x04' { // IPv6
           let mut address: [u8; 16] = Default::default();
           address.copy_from_slice(&req[4..20]);
           connection.hostname = format!("{}", Ipv6Addr::from(address));
-          connection.portno = (req[20] as u16) << 8;
-          connection.portno += req[21] as u16;
+          connection.portno = u16::from(req[20]) << 8;
+          connection.portno += u16::from(req[21]);
         }
         else {
-          println!("\rInvalid SOCKS5 address request from {}", connection.peer_addr);
-          cleanup();
+          cleanup(&format!("Invalid SOCKS5 address request from {}", connection.peer_addr));
           return;
         }
       }
       else {
         if &req[0..2] != b"\x04\x01" {
-          println!("\rInvalid SOCKS4 request from {}", connection.peer_addr);
-          cleanup();
+          cleanup(&format!("Invalid SOCKS4 request from {}", connection.peer_addr));
           return;
         }
         connection.hostname = format!("{}.{}.{}.{}", req[4], req[5], req[6], req[7]);
-        connection.portno = (req[2] as u16) << 8;
-        connection.portno += req[3] as u16;
+        connection.portno = u16::from(req[2]) << 8;
+        connection.portno += u16::from(req[3]);
       }
 
       for rule in rules.iter() {
@@ -325,8 +315,7 @@ fn main() {
         match select_server(&pool, hashhost) {
           Ok(i) => idx = i,
           Err(msg) => {
-            println!("\r{}", msg);
-            cleanup();
+            cleanup(msg);
             return;
           }
         }
@@ -334,22 +323,20 @@ fn main() {
       let mut server = thr_servers.get(idx).expect("Invalid server index");
       if server.online.load(Ordering::Relaxed) != true {
         if routing == "rule" {
-          println!("Rule directed server is offline");
-          cleanup();
+          cleanup("Rule directed server is offline");
           return;
         }
         let mut i = 0;
         let result = loop {
           if i == pool.len() { break None; }
           let server = thr_servers.get(pool[i]).expect("Invalid server index in pool");
-          if server.online.load(Ordering::Relaxed) == true { break Some(server); }
+          if server.online.load(Ordering::Relaxed) { break Some(server); }
           i += 1;
         };
         match result {
           Some(res) => { server = res; }
           None => {
-            println!("No online server found in pool");
-            cleanup();
+            cleanup("No online server found in pool");
             return;
           }
         }
@@ -359,7 +346,7 @@ fn main() {
         let errors = server.errors.read().unwrap();
         let mut count = 0;
         for error in errors.iter() {
-          if *error == true { count += 1; }
+          if *error { count += 1; }
         }
         if count > 0 { println!("\rServer {} has {}% error rate", idx, count*10); }
       }
@@ -367,37 +354,108 @@ fn main() {
       let server = server;
       println!("\r{:3} connections | [{}] Routed {}:{} to server {} ({})", threads, routing, connection.hostname, connection.portno, idx, server.hostname);
 
-      let mut tunnel = if idx == 0 {
+      let mut tunnel = if idx == 0 { // Handle server 0 (direct connection) case
         match TcpStream::connect((&*connection.hostname, connection.portno)) {
           Ok(tunnel) => {
-            if connection.proto == 4 { stream.write(b"\x00\x5A").expect("Failed to write SOCKS4 handshake to tunnel"); }
-            else { stream.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00").expect("Failed to write SOCKS5 handshake to tunnel"); }
+            if connection.proto == 4 {
+              match stream.write(b"\x00\x5A") {
+                Ok(2) => (),
+                _ => {
+                  cleanup("Failed to write SOCKS4 handshake to tunnel");
+                  return;
+                }
+              }
+            }
+            else {
+              match stream.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00") {
+                Ok(10) => (),
+                _ => {
+                  cleanup("Failed to write SOCKS5 handshake to tunnel");
+                  return;
+                }
+              }
+            }
             tunnel
           },
           Err(err) => {
-            println!("\rFailed to make direct connection to {}:{}", connection.hostname, connection.portno);
-            if connection.proto == 4 { stream.write(b"\x00\x5B").expect("Failed to write SOCKS4 error back to client"); }
-            else {
-              match err.kind() {
-                ErrorKind::ConnectionRefused => { stream.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00").expect("Failed to write SOCKS5 error back to client"); },
-                _ => { stream.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00").expect("Failed to write SOCKS5 error back to client"); }
+            let mut error = format!("\rFailed to make direct connection to {}:{}", connection.hostname, connection.portno);
+            if connection.proto == 4 {
+              match stream.write(b"\x00\x5B") {
+                Ok(2) => (),
+                _ => error.push_str("Failed to write SOCKS4 error back to client")
               }
             }
-            cleanup();
+            else {
+              match err.kind() {
+                ErrorKind::ConnectionRefused => {
+                  match stream.write(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00") {
+                    Ok(10) => (),
+                    _ => error.push_str("Failed to write SOCKS5 error back to client")
+                  }
+                },
+                _ => {
+                  match stream.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00") {
+                    Ok(10) => (),
+                    _ => error.push_str("Failed to write SOCKS5 error back to client")
+                  }
+                }
+              }
+            }
+            cleanup(&error);
             return;
           }
         }
       }
-      else { TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port") }; // TODO: report error back to client here and push to Server.errors
+      else {
+        match TcpStream::connect(("127.0.0.1", server.portno as u16)) {
+          Ok(stream) => stream,
+          Err(_) => {
+            server.push_status(true);
+            cleanup("Failed to connect to tunnel port");
+            return;
+          }
+        }
+      };
+
       tunnel.set_read_timeout(Some(connect_timeout)).expect("Failed to set read timeout on TcpStream");
       tunnel.set_write_timeout(Some(connect_timeout)).expect("Failed to set write timeout on TcpStream");
       let mut buf: [u8; 1500] = [0; 1500];
       if idx != 0 {
-        if connection.proto == 4 { tunnel.write(&req[0..bytes]).expect("Failed to write SOCKS4 request to tunnel"); }
+        if connection.proto == 4 {
+          match tunnel.write(&req[0..bytes]) {
+            Ok(c) if c == bytes => (),
+            _ => {
+              server.push_status(true);
+              cleanup("Failed to write SOCKS4 request to tunnel");
+              return;
+            }
+          }
+        }
         else {
-          let _ = tunnel.write(b"\x05\x01\x00").expect("Failed to write SOCKS5 request to tunnel");
-          let _ = tunnel.read(&mut buf).expect("Failed to read SOCKS5 auth response from tunnel"); // TODO: check the SOCKS5 response here
-          let _ = tunnel.write(&req[0..bytes]).expect("Failed to write SOCKS5 request to tunnel");
+          match tunnel.write(b"\x05\x01\x00") {
+            Ok(3) => (),
+            _ => {
+              server.push_status(true);
+              cleanup("Failed to write SOCKS5 request to tunnel");
+              return;
+            }
+          }
+          match tunnel.read(&mut buf) { // TODO: check the SOCKS5 response here
+            Ok(_) => (),
+            _ => {
+              server.push_status(true);
+              cleanup("Failed to read SOCKS5 auth response from tunnel");
+              return;
+            }
+          }
+          match tunnel.write(&req[0..bytes]) {
+            Ok(c) if c == bytes => (),
+            _ => {
+              server.push_status(true);
+              cleanup("Failed to write SOCKS5 request to tunnel");
+              return;
+            }
+          }
         }
       }
       let mut tunnel_read = tunnel.try_clone().expect("Failed to clone tunnel TcpStream");
@@ -421,7 +479,7 @@ fn main() {
               }
               count += 1;
               if count == 1 { // SOCKS server response
-                let _ = tunnel_read.set_read_timeout(Some(idle_timeout)).expect("Failed to set read timeout on TcpStream");
+                tunnel_read.set_read_timeout(Some(idle_timeout)).expect("Failed to set read timeout on TcpStream");
                 conn_ms = (thr_conn.start.elapsed().as_secs()*1000) as usize; // TODO: change this to use Duration::as_millis() as soon as that feature stabilizes
                 conn_ms += thr_conn.start.elapsed().subsec_millis() as usize;
                 thr_serv.conn_count.fetch_add(1, Ordering::Relaxed);
@@ -462,7 +520,7 @@ fn main() {
         match stream.read(&mut buf) {
           Ok(c) => {
             if c == 0 { break; }
-            if connection.outbound == 0 { let _ = stream.set_read_timeout(Some(idle_timeout)).expect("Failed to set read timeout on TcpStream"); }
+            if connection.outbound == 0 { stream.set_read_timeout(Some(idle_timeout)).expect("Failed to set read timeout on TcpStream"); }
             connection.outbound += c as u64;
             if let Err(e) = tunnel.write_all(&buf[0..c]) {
               println!("\r[{}/{}] Write error on tunnel: {}", server.hostname, connection.hostname, e.to_string());
@@ -507,7 +565,7 @@ fn main() {
         let mut file = OpenOptions::new().append(true).create(true).open(&app.connlog).expect("Failed to open connection log file");
         let mut line = Vec::new();
         writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data{}", connection.hostname, connection.portno, routing, server.hostname, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms, connection.errors).unwrap();
-        file.write(&line).expect("\rFailed to write to connection log");
+        file.write_all(&line).expect("\rFailed to write to connection log");
       }
     });
 
@@ -524,7 +582,7 @@ fn main() {
   }
 }
 
-fn select_server(pool: &Vec<usize>, host: &str) -> Result<usize, &'static str> {
+fn select_server(pool: &[usize], host: &str) -> Result<usize, &'static str> {
   let mut hasher = DefaultHasher::new();
   host.hash(&mut hasher);
   let hash = hasher.finish() as usize;
@@ -532,7 +590,8 @@ fn select_server(pool: &Vec<usize>, host: &str) -> Result<usize, &'static str> {
   Ok(serverno)
 }
 
-fn cleanup() {
+fn cleanup(error: &str) {
+  if !error.is_empty() { println!("\r{}", error); }
   let threads = THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
   print!("\r{:3} connections | ", threads-1);
   stdout().flush().expect("Failed to flush stdout");
