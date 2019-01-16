@@ -548,7 +548,10 @@ fn main() {
       loop {
         match stream.read(&mut buf) {
           Ok(c) => {
-            if c == 0 { break; }
+            if c == 0 {
+              if connection.outbound == 0 { connection.errors.push_str(" / no requests"); }
+              break;
+            }
             if connection.outbound == 0 { stream.set_read_timeout(Some(app.idletimeout)).expect("Failed to set read timeout on TcpStream"); }
             connection.outbound += c as u64;
             if let Err(e) = tunnel.write_all(&buf[0..c]) {
@@ -579,7 +582,7 @@ fn main() {
           connection.inbound = inbound;
           connection.conn_ms = conn_ms;
           connection.data_ms = data_ms;
-          connection.errors.push_str(errors);
+          if connection.errors != " / no requests" { connection.errors.push_str(errors); }
         },
         Err(_) => {
           println!("\rHost {} port {} reading thread panicked", connection.hostname, connection.portno);
