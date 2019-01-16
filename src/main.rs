@@ -457,8 +457,11 @@ fn main() {
           }
           Err(e) => {
             if e.kind() == ErrorKind::WouldBlock {
-              println!("\r[{}/{}] Read timeout on client ({} bytes read)", server.hostname, connection.hostname, connection.outbound);
-              connection.errors.push_str(" / read timeout on client");
+              if connection.outbound > 0 {
+                println!("\r[{}/{}] Read timeout on client ({} bytes read)", server.hostname, connection.hostname, connection.outbound);
+                connection.errors.push_str(" / read timeout on client");
+              }
+              else { connection.errors.push_str(" / no requests"); }
             }
             else {
               println!("\r[{}/{}] Read error on client: {}", server.hostname, connection.hostname, e.to_string());
