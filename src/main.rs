@@ -8,7 +8,7 @@ use std::net::{TcpListener, TcpStream, SocketAddr, Ipv6Addr};
 use std::time::{Duration, Instant};
 use std::thread;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{Ordering, AtomicBool, AtomicUsize, ATOMIC_USIZE_INIT};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -29,15 +29,16 @@ struct Server {
     hostname: String,
     portno: i64,
     online: Arc<AtomicBool>,
-    online_since: Arc<Mutex<Instant>>,
+    online_since: Arc<RwLock<Instant>>,
     responsive: Arc<AtomicBool>,
     conn_count: Arc<AtomicUsize>,
     conn_avg: Arc<AtomicUsize>,
-    conn_best: Arc<AtomicUsize>
+    conn_best: Arc<AtomicUsize>,
+    errors: Arc<RwLock<Vec<bool>>>
 }
 impl Server {
   fn new(id: usize, hostname: String, portno: i64) -> Server {
-    Server { id, hostname, portno, online: Arc::new(AtomicBool::new(false)), online_since: Arc::new(Mutex::new(Instant::now())), responsive: Arc::new(AtomicBool::new(true)), conn_count: Arc::new(ATOMIC_USIZE_INIT), conn_avg: Arc::new(ATOMIC_USIZE_INIT), conn_best: Arc::new(AtomicUsize::new(usize::max_value())) }
+    Server { id, hostname, portno, online: Arc::new(AtomicBool::new(false)), online_since: Arc::new(RwLock::new(Instant::now())), responsive: Arc::new(AtomicBool::new(true)), conn_count: Arc::new(ATOMIC_USIZE_INIT), conn_avg: Arc::new(ATOMIC_USIZE_INIT), conn_best: Arc::new(AtomicUsize::new(usize::max_value())), errors: Arc::new(RwLock::new(vec![false; 10])) }
   }
 }
 
@@ -147,7 +148,7 @@ fn main() {
                                 .spawn().expect(&format!("Failed to launch ssh session to {}", server.hostname));
         server.online.store(true, Ordering::Relaxed);
         {
-          let mut instant = server.online_since.lock().unwrap();
+          let mut instant = server.online_since.write().unwrap();
           *instant = Instant::now();
         }
         let ecode = child.wait().expect("Failed to wait on child");
@@ -497,7 +498,7 @@ fn main() {
           0 => 0,
           _ => server.conn_avg.load(Ordering::Relaxed)/server.conn_count.load(Ordering::Relaxed)
         };
-        println!("\rServer {} online_secs {} connections {:#?} con_avg {:#?} con_best {:#?}", server.hostname, server.online_since.lock().unwrap().elapsed().as_secs(), server.conn_count, con_avg, if con_avg != 0 { server.conn_best.load(Ordering::Relaxed) } else { 0 });
+        println!("\rServer {} online_secs {} connections {:#?} con_avg {:#?} con_best {:#?}", server.hostname, server.online_since.read().unwrap().elapsed().as_secs(), server.conn_count, con_avg, if con_avg != 0 { server.conn_best.load(Ordering::Relaxed) } else { 0 });
       }
       info_last = Instant::now();
     }
