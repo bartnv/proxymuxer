@@ -349,6 +349,16 @@ fn main() {
           }
         }
       }
+
+      {
+        let errors = server.errors.read().unwrap();
+        let mut count = 0;
+        for error in errors.iter() {
+          if *error == true { count += 1; }
+        }
+        if count > 0 { println!("\rServer {} has {}% error rate", idx, count*10); }
+      }
+
       let server = server;
       println!("\r{:3} connections | [{}] Routed {}:{} to server {} ({})", threads, routing, connection.hostname, connection.portno, idx, server.hostname);
 
@@ -373,7 +383,7 @@ fn main() {
           }
         }
       }
-      else { TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port") }; // TODO: report error back to client here too
+      else { TcpStream::connect(("127.0.0.1", server.portno as u16)).expect("Failed to connect to tunnel port") }; // TODO: report error back to client here and push to Server.errors
       tunnel.set_read_timeout(Some(connect_timeout)).expect("Failed to set read timeout on TcpStream");
       tunnel.set_write_timeout(Some(connect_timeout)).expect("Failed to set write timeout on TcpStream");
       let mut buf: [u8; 1500] = [0; 1500];
@@ -485,6 +495,11 @@ fn main() {
         }
       }
 
+      {
+        let mut errors = server.errors.write().unwrap();
+        errors.remove(0);
+        errors.push(if connection.errors.contains("tunnel") { true } else { false });
+      }
       cleanup();
 
       if !app.connlog.is_empty() {
