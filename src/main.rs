@@ -20,7 +20,9 @@ struct App {
   listenport: i64,
   startport: i64,
   sshargs: String,
-  connlog: String
+  connlog: String,
+  conntimeout: Duration,
+  idletimeout: Duration
 }
 
 #[derive(Clone, Debug)]
@@ -38,7 +40,16 @@ struct Server {
 }
 impl Server {
   fn new(id: usize, hostname: String, portno: i64) -> Server {
-    Server { id, hostname, portno, online: Arc::new(AtomicBool::new(false)), online_since: Arc::new(RwLock::new(Instant::now())), responsive: Arc::new(AtomicBool::new(true)), conn_count: Arc::new(ATOMIC_USIZE_INIT), conn_avg: Arc::new(ATOMIC_USIZE_INIT), conn_best: Arc::new(AtomicUsize::new(usize::max_value())), errors: Arc::new(RwLock::new(vec![false; 10])) }
+    Server {
+      id, hostname, portno,
+      online: Arc::new(AtomicBool::new(false)),
+      online_since: Arc::new(RwLock::new(Instant::now())),
+      responsive: Arc::new(AtomicBool::new(true)),
+      conn_count: Arc::new(ATOMIC_USIZE_INIT),
+      conn_avg: Arc::new(ATOMIC_USIZE_INIT),
+      conn_best: Arc::new(AtomicUsize::new(usize::max_value())),
+      errors: Arc::new(RwLock::new(vec![false; 10]))
+    }
   }
   fn push_status(&self, is_error: bool) {
     let mut errors = self.errors.write().unwrap();
@@ -82,7 +93,14 @@ struct Rule {
 static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
 
 fn main() {
-  let mut app = App { listenport: 8080, startport: 61234, sshargs: String::from("-N"), connlog: String::new() };
+  let mut app = App {
+    listenport: 8080,
+    startport: 61234,
+    sshargs: String::from("-N"),
+    connlog: String::new(),
+    conntimeout: Duration::new(10, 0), // 10 seconds
+    idletimeout: Duration::new(300, 0) // 5 minutes
+  };
   let mut file = File::open("config.yml").expect("Failed to read configuration file: config.yml");
   let mut config_str = String::new();
   file.read_to_string(&mut config_str).expect("Configuration file contains invalid UTF8");
@@ -96,8 +114,6 @@ fn main() {
       }
   }
   let config = &docs[0];
-  let connect_timeout = Duration::new(10, 0); // 10 seconds
-  let idle_timeout = Duration::new(300, 0); // 5 minutes
   let re = Arc::new(Matches {
     ipv4: Regex::new(r"^(\d{1,3}\.\d{1,3})\.\d{1,3}\.\d{1,3}$").unwrap(),
     ipv6: Regex::new(r"^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+):").unwrap(),
@@ -120,6 +136,18 @@ fn main() {
   if !config["connectionlog"].is_badvalue() {
     app.connlog = config["connectionlog"].as_str().expect("Invalid 'connectionlog' setting in config.yml").to_string();
     if !app.connlog.is_empty() { println!("Writing connection log to {}", app.connlog); }
+  }
+  if !config["conntimeout"].is_badvalue() {
+    let seconds = config["conntimeout"].as_i64().expect("Invalid 'conntimeout' setting in config.yml");
+    if seconds <= 0 { panic!("Invalid 'conntimeout' setting in config.yml: must be larger than zero") }
+    app.conntimeout = Duration::new(seconds as u64, 0);
+    println!("Connection timeout set to {} seconds", seconds);
+  }
+  if !config["idletimeout"].is_badvalue() {
+    let seconds = config["idletimeout"].as_i64().expect("Invalid 'idletimeout' setting in config.yml");
+    if seconds <= 0 { panic!("Invalid 'idletimeout' setting in config.yml: must be larger than zero") }
+    app.idletimeout = Duration::new(seconds as u64, 0);
+    println!("Idle timeout set to {} seconds", seconds);
   }
 
   let mut servers: Vec<Server> = Vec::new();
@@ -205,8 +233,8 @@ fn main() {
         continue;
       }
     };
-    stream.set_read_timeout(Some(connect_timeout)).expect("Failed to set read timeout on TcpStream");
-    stream.set_write_timeout(Some(connect_timeout)).expect("Failed to set write timeout on TcpStream");
+    stream.set_read_timeout(Some(app.conntimeout)).expect("Failed to set read timeout on TcpStream");
+    stream.set_write_timeout(Some(app.conntimeout)).expect("Failed to set write timeout on TcpStream");
     if stream.peer_addr().is_err() {
       println!("\rFailed to get peer_addr() from stream: {}", stream.peer_addr().unwrap_err().to_string());
       continue;
@@ -417,8 +445,8 @@ fn main() {
         }
       };
 
-      tunnel.set_read_timeout(Some(connect_timeout)).expect("Failed to set read timeout on TcpStream");
-      tunnel.set_write_timeout(Some(connect_timeout)).expect("Failed to set write timeout on TcpStream");
+      tunnel.set_read_timeout(Some(app.conntimeout)).expect("Failed to set read timeout on TcpStream");
+      tunnel.set_write_timeout(Some(app.conntimeout)).expect("Failed to set write timeout on TcpStream");
       let mut buf: [u8; 1500] = [0; 1500];
       if idx != 0 {
         if connection.proto == 4 {
@@ -462,6 +490,7 @@ fn main() {
       let mut stream_write = stream.try_clone().expect("Failed to clone client TcpStream");
       let thr_conn = connection.clone();
       let thr_serv = server.clone();
+      let thr_app = app.clone();
 
       let inbound = thread::spawn(move || { // inbound data thread
         let mut buf: [u8; 1500] = [0; 1500];
@@ -479,7 +508,7 @@ fn main() {
               }
               count += 1;
               if count == 1 { // SOCKS server response
-                tunnel_read.set_read_timeout(Some(idle_timeout)).expect("Failed to set read timeout on TcpStream");
+                tunnel_read.set_read_timeout(Some(thr_app.idletimeout)).expect("Failed to set read timeout on TcpStream");
                 conn_ms = (thr_conn.start.elapsed().as_secs()*1000) as usize; // TODO: change this to use Duration::as_millis() as soon as that feature stabilizes
                 conn_ms += thr_conn.start.elapsed().subsec_millis() as usize;
                 thr_serv.conn_count.fetch_add(1, Ordering::Relaxed);
@@ -520,7 +549,7 @@ fn main() {
         match stream.read(&mut buf) {
           Ok(c) => {
             if c == 0 { break; }
-            if connection.outbound == 0 { stream.set_read_timeout(Some(idle_timeout)).expect("Failed to set read timeout on TcpStream"); }
+            if connection.outbound == 0 { stream.set_read_timeout(Some(app.idletimeout)).expect("Failed to set read timeout on TcpStream"); }
             connection.outbound += c as u64;
             if let Err(e) = tunnel.write_all(&buf[0..c]) {
               println!("\r[{}/{}] Write error on tunnel: {}", server.hostname, connection.hostname, e.to_string());
