@@ -351,7 +351,7 @@ fn main() {
       let mut server = thr_servers.get(idx).expect("Invalid server index");
       if server.online.load(Ordering::Relaxed) != true {
         if routing == "rule" {
-          cleanup("Rule directed server is offline");
+          cleanup(&format!("Rule directed server {} is offline", idx));
           return;
         }
         let mut i = 0;
