@@ -56,6 +56,14 @@ impl Server {
     errors.remove(0);
     errors.push(is_error);
   }
+  fn get_error_pct(&self) -> u16 {
+    let errors = self.errors.read().unwrap();
+    let mut count = 0;
+    for error in errors.iter() {
+      if *error { count += 10; }
+    }
+    count
+  }
 }
 
 #[derive(Clone, Debug)]
@@ -104,15 +112,14 @@ fn main() {
   let mut file = File::open("config.yml").expect("Failed to read configuration file: config.yml");
   let mut config_str = String::new();
   file.read_to_string(&mut config_str).expect("Configuration file contains invalid UTF8");
-  let docs;
-  match YamlLoader::load_from_str(&config_str) {
-      Ok(r) => docs = r,
-      Err(e) => {
-          println!("Configuration file contains invalid YAML:");
-          println!("{:?}", e);
-          return;
-      }
-  }
+  let docs = match YamlLoader::load_from_str(&config_str) {
+    Ok(r) => r,
+    Err(e) => {
+        println!("Configuration file contains invalid YAML:");
+        println!("{:?}", e);
+        return;
+    }
+  };
   let config = &docs[0];
   let re = Arc::new(Matches {
     ipv4: Regex::new(r"^(\d{1,3}\.\d{1,3})\.\d{1,3}\.\d{1,3}$").unwrap(),
@@ -370,13 +377,9 @@ fn main() {
         }
       }
 
-      {
-        let errors = server.errors.read().unwrap();
-        let mut count = 0;
-        for error in errors.iter() {
-          if *error { count += 1; }
-        }
-        if count > 0 { println!("\rServer {} has {}% error rate", idx, count*10); }
+      match server.get_error_pct() {
+        0 => (),
+        n => println!("\rServer {} has {}% error rate", idx, n)
       }
 
       let server = server;
@@ -598,7 +601,7 @@ fn main() {
       }
     });
 
-    if info_last.elapsed() > Duration::new(900, 0) {
+    if info_last.elapsed() > Duration::new(3600, 0) {
       for server in servers.clone() {
         let con_avg = match server.conn_count.load(Ordering::Relaxed) {
           0 => 0,
