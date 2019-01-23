@@ -158,21 +158,27 @@ fn main() {
   }
 
   let mut servers: Vec<Server> = Vec::new();
-  {
-    let direct = Server::new(0, "direct".to_owned(), 0);
-    direct.online.store(true, Ordering::Relaxed);
-    servers.push(direct);
-  }
+  servers.push(Server::new(0, "blackhole".to_string(), 0));
 
   let mut count = 0;
   for entry in config["servers"].as_vec().expect("Invalid 'servers' setting in config.yml") {
     count += 1;
     let hostname = entry.as_str().expect("Invalid entry in 'servers' setting in config.yml").to_owned();
-    let server = Server::new(count, hostname, app.startport);
-    servers.push(server.clone());
-    let argstring = app.sshargs.clone();
-    app.startport += 1;
+    let server;
+    if hostname == "direct" {
+      server = Server::new(count, hostname, 0);
+      server.online.store(true, Ordering::Relaxed);
+    }
+    else {
+      server = Server::new(count, hostname, app.startport);
+      app.startport += 1;
+    }
     println!("Added server {}: {}", count, server.hostname);
+    servers.push(server.clone());
+
+    if server.portno == 0 { continue; }
+
+    let argstring = app.sshargs.clone();
     thread::spawn(move || {
       prctl::set_name(&format!("Server {}", server.id)).expect("Failed to set process name");
       let recon_delay = Duration::new(60, 0);
@@ -335,6 +341,28 @@ fn main() {
         if rule.regex.is_match(&connection.hostname) {
           idx = rule.server;
           routing = "rule";
+          if idx == 0 { // idx 0 is the blackhole route
+            if connection.proto == 4 {
+              match stream.write(b"\x00\x5B") {
+                Ok(2) => (),
+                _ => {
+                  cleanup("Failed to write SOCKS4 response to client");
+                  return;
+                }
+              }
+            }
+            else {
+              match stream.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00") {
+                Ok(10) => (),
+                _ => {
+                  cleanup("Failed to write SOCKS5 response to client");
+                  return;
+                }
+              }
+            }
+            cleanup(&format!("{:3} connections | [{}] Routed {}:{} to blackhole", threads, routing, connection.hostname, connection.portno));
+            return;
+          }
           prctl::set_name(&format!("Rule {}", rule.rule)).expect("Failed to set process name");
           break;
         }
@@ -385,14 +413,14 @@ fn main() {
       let server = server;
       println!("\r{:3} connections | [{}] Routed {}:{} to server {} ({})", threads, routing, connection.hostname, connection.portno, idx, server.hostname);
 
-      let mut tunnel = if idx == 0 { // Handle server 0 (direct connection) case
+      let mut tunnel = if server.portno == 0 { // Handle direct connection case (server has portno set to zero)
         match TcpStream::connect((&*connection.hostname, connection.portno)) {
           Ok(tunnel) => {
             if connection.proto == 4 {
               match stream.write(b"\x00\x5A") {
                 Ok(2) => (),
                 _ => {
-                  cleanup("Failed to write SOCKS4 handshake to tunnel");
+                  cleanup("Failed to write SOCKS4 response to client");
                   return;
                 }
               }
@@ -401,7 +429,7 @@ fn main() {
               match stream.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00") {
                 Ok(10) => (),
                 _ => {
-                  cleanup("Failed to write SOCKS5 handshake to tunnel");
+                  cleanup("Failed to write SOCKS5 response to client");
                   return;
                 }
               }
@@ -451,7 +479,7 @@ fn main() {
       tunnel.set_read_timeout(Some(app.conntimeout)).expect("Failed to set read timeout on TcpStream");
       tunnel.set_write_timeout(Some(app.conntimeout)).expect("Failed to set write timeout on TcpStream");
       let mut buf: [u8; 1500] = [0; 1500];
-      if idx != 0 {
+      if server.portno != 0 {
         if connection.proto == 4 {
           match tunnel.write(&req[0..bytes]) {
             Ok(c) if c == bytes => (),
