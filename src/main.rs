@@ -342,11 +342,12 @@ fn main() {
           idx = rule.server;
           routing = "rule";
           if idx == 0 { // idx 0 is the blackhole route
+            thr_servers.get(0).unwrap().conn_count.fetch_add(1, Ordering::Relaxed);
             if connection.proto == 4 {
               match stream.write(b"\x00\x5B") {
                 Ok(2) => (),
                 _ => {
-                  cleanup("Failed to write SOCKS4 response to client");
+                  cleanup("Failed to write blackhole SOCKS4 response to client");
                   return;
                 }
               }
@@ -355,7 +356,7 @@ fn main() {
               match stream.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00") {
                 Ok(10) => (),
                 _ => {
-                  cleanup("Failed to write SOCKS5 response to client");
+                  cleanup("Failed to write blackhole SOCKS5 response to client");
                   return;
                 }
               }
