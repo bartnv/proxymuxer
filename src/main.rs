@@ -29,6 +29,7 @@ struct App {
 struct Server {
     id: usize,
     hostname: String,
+    bind_addr: String,
     portno: i64,
     online: Arc<AtomicBool>,
     online_since: Arc<RwLock<Instant>>,
@@ -42,6 +43,7 @@ impl Server {
   fn new(id: usize, hostname: String, portno: i64) -> Server {
     Server {
       id, hostname, portno,
+      bind_addr: String::new(),
       online: Arc::new(AtomicBool::new(false)),
       online_since: Arc::new(RwLock::new(Instant::now())),
       responsive: Arc::new(AtomicBool::new(true)),
@@ -164,13 +166,18 @@ fn main() {
   for entry in config["servers"].as_vec().expect("Invalid 'servers' setting in config.yml") {
     count += 1;
     let hostname = entry.as_str().expect("Invalid entry in 'servers' setting in config.yml").to_owned();
-    let server;
+    let mut server;
     if hostname == "direct" {
       server = Server::new(count, hostname, 0);
       server.online.store(true, Ordering::Relaxed);
     }
     else {
       server = Server::new(count, hostname, app.startport);
+      if let Some(x) = server.hostname.find('|') {
+        server.bind_addr.push_str(&server.hostname[x+1..]);
+        server.hostname.truncate(x);
+        server.hostname.shrink_to_fit();
+      }
       app.startport += 1;
     }
     println!("Added server {}: {}", count, server.hostname);
@@ -184,14 +191,17 @@ fn main() {
       let recon_delay = Duration::new(60, 0);
       thread::sleep(Duration::new(1, 0));
       loop {
-        println!("\rConnecting to {} with listen port {}", server.hostname, server.portno);
+        if server.bind_addr.is_empty() { println!("\rConnecting to {} with listen port {}", server.hostname, server.portno); }
+        else { println!("\rConnecting to {} with listen port {} using bind address {}", server.hostname, server.portno, server.bind_addr); }
         let argvec: Vec<&str> = argstring.split_whitespace().collect();
-        let mut child = Command::new("ssh")
-                                .arg("-D")
-                                .arg(format!("localhost:{}", server.portno))
-                                .args(argvec)
-                                .arg(server.hostname.clone())
-                                .spawn().unwrap_or_else(|_| panic!("Failed to launch ssh session to {}", server.hostname));
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-D")
+           .arg(format!("localhost:{}", server.portno))
+           .args(argvec);
+        if !server.bind_addr.is_empty() {
+          cmd.arg("-b").arg(server.bind_addr.clone());
+        }
+        let mut child = cmd.arg(server.hostname.clone()).spawn().unwrap_or_else(|_| panic!("Failed to launch ssh session to {}", server.hostname));
         server.online.store(true, Ordering::Relaxed);
         {
           let mut instant = server.online_since.write().unwrap();
