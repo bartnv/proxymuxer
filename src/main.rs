@@ -100,6 +100,38 @@ struct Rule {
   server: usize
 }
 
+pub trait DurationToString {
+  fn to_string(self) -> String;
+}
+impl DurationToString for Duration {
+  fn to_string(self) -> String {
+    let mut secs = self.as_secs();
+    let mut result = String::with_capacity(10);
+
+    if secs == 0 {
+      result.push_str("0s");
+      return result;
+    }
+
+    let delta = [ 31449600, 604800, 86400, 3600, 60, 1 ];
+    let unit = [ 'y', 'w', 'd', 'h', 'm', 's' ];
+    let mut c = 0;
+
+    loop {
+      if secs >= delta[c] { break; }
+      c += 1;
+    }
+    result.push_str(&format!("{}{}", secs/delta[c], unit[c]));
+    secs = secs%delta[c];
+    if secs != 0 {
+      c += 1;
+      result.push_str(&format!(" {}{}", secs/delta[c], unit[c]));
+    }
+    return result;
+  }
+}
+
+
 static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
 
 fn main() {
@@ -247,7 +279,6 @@ fn main() {
   let rules = Arc::new(rules); // RefCount and make immutable
 
   let server = TcpListener::bind(("0.0.0.0", app.listenport as u16)).expect("Failed to bind to listen port");
-  let mut info_last = Instant::now();
   for client in server.incoming() {
     let mut stream = match client {
       Ok(stream) => stream,
@@ -347,12 +378,18 @@ fn main() {
         connection.portno += u16::from(req[3]);
       }
 
+      if connection.hostname == "proxy.muxer" {
+        status_page(connection, stream, thr_servers);
+        cleanup("");
+        return;
+      }
+
       for rule in rules.iter() {
         if rule.regex.is_match(&connection.hostname) {
           idx = rule.server;
           routing = "rule";
           if idx == 0 { // idx 0 is the blackhole route
-            thr_servers.get(0).unwrap().conn_count.fetch_add(1, Ordering::Relaxed);
+            thr_servers[0].conn_count.fetch_add(1, Ordering::Relaxed);
             if connection.proto == 4 {
               match stream.write(b"\x00\x5B") {
                 Ok(2) => (),
@@ -639,17 +676,6 @@ fn main() {
         file.write_all(&line).expect("\rFailed to write to connection log");
       }
     });
-
-    if info_last.elapsed() > Duration::new(3600, 0) {
-      for server in servers.clone() {
-        let con_avg = match server.conn_count.load(Ordering::Relaxed) {
-          0 => 0,
-          _ => server.conn_avg.load(Ordering::Relaxed)/server.conn_count.load(Ordering::Relaxed)
-        };
-        println!("\rServer {} online_secs {} connections {:#?} con_avg {:#?} con_best {:#?}", server.hostname, server.online_since.read().unwrap().elapsed().as_secs(), server.conn_count, con_avg, if con_avg != 0 { server.conn_best.load(Ordering::Relaxed) } else { 0 });
-      }
-      info_last = Instant::now();
-    }
   }
 }
 
@@ -666,4 +692,45 @@ fn cleanup(error: &str) {
   let threads = THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
   print!("\r{:3} connections | ", threads-1);
   stdout().flush().expect("Failed to flush stdout");
+}
+
+fn status_page(connection: Connection, mut stream: TcpStream, servers: Vec<Server>) -> &'static str {
+  if connection.proto == 4 {
+    match stream.write(b"\x00\x5A") {
+      Ok(2) => (),
+      _ => return "Failed to write SOCKS4 response to client"
+    }
+  }
+  else {
+    match stream.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00") {
+      Ok(10) => (),
+      _ => return "Failed to write SOCKS5 response to client"
+    }
+  }
+  let mut buf: [u8; 1500] = [0; 1500];
+  let _ = stream.read(&mut buf);
+  if buf.starts_with(b"GET ") {
+    let headers = "HTTP/1.1 200 OK\r\n\
+                   Content-Type: text/html\r\n\
+                   Connection: Close\r\n\r\n\
+                   <!doctype html><html><head><title>ProxyMuxer status</title>\n\
+                   <style>TABLE { border-collapse: collapse; } TH,TD { border: solid black 1px; padding: 5px; }</style></head>\n\
+                   <body><table><tr><th>Server<th>Status<th>Since<th>Connections<th>Error rate<th>Avg connect delay<th>Best connect delay</tr>\n";
+    if stream.write_all(headers.as_bytes()).is_err() { return "Failed to write status page headers to client"; }
+    for server in servers.clone() {
+      let con_avg = match server.conn_count.load(Ordering::Relaxed) {
+        0 => 0,
+        _ => server.conn_avg.load(Ordering::Relaxed)/server.conn_count.load(Ordering::Relaxed)
+      };
+      if stream.write_all(
+        format!("<tr><td>{}<td>{}<td>{}<td>{:#?}<td>{:#?}%<td>{:#?}<td>{:#?}</tr>\n", server.hostname,
+        if server.online.load(Ordering::Relaxed) { "online" } else { "offline" },
+        server.online_since.read().unwrap().elapsed().to_string(), server.conn_count,
+        server.get_error_pct(), con_avg,
+        if con_avg != 0 { server.conn_best.load(Ordering::Relaxed) } else { 0 }).as_bytes()
+      ).is_err() { return "Failed to write status page data to client" }
+    }
+    if stream.write_all(b"</table></body></html>").is_err() { return "Failed to write status page footer to client" }
+  }
+  return ""
 }
