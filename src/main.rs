@@ -1,9 +1,11 @@
 extern crate yaml_rust;
 extern crate regex;
 extern crate prctl;
+extern crate signal_hook;
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, ErrorKind, stdout};
+use std::mem::drop;
 use std::net::{TcpListener, TcpStream, SocketAddr, Ipv6Addr};
 use std::time::{Duration, Instant};
 use std::thread;
@@ -12,7 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::sync::atomic::{Ordering, AtomicBool, AtomicUsize, ATOMIC_USIZE_INIT};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use yaml_rust::YamlLoader;
+use yaml_rust::{Yaml, YamlLoader};
 use regex::Regex;
 
 #[derive(Clone)]
@@ -268,18 +270,29 @@ fn main() {
   };
   println!("Set hash-based random pool to {:?}", pool);
 
-  let mut rules = Vec::new();
-  for (rule, server) in config["rules"].as_hash().expect("Invalid 'rules' setting in config.yml") {
-    let rule = rule.as_str().expect("Invalid key in 'rules' setting in config.yml").to_owned();
-    let server = server.as_i64().expect("Invalid value in 'rules' setting in config.yml") as usize;
-    let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
-    println!("Added rule {} for server {}", &rule, &server);
-    rules.push(Rule { rule, regex: Regex::new(&pattern).unwrap(), server });
-  }
-  let rules = Arc::new(rules); // RefCount and make immutable
+  let rules = Arc::new(RwLock::new(Vec::new()));
+  load_rules(&rules, config);
+  drop(config);
+  let hup = Arc::new(AtomicBool::new(false));
+  signal_hook::flag::register(signal_hook::SIGHUP, Arc::clone(&hup)).expect("Failed to register SIGHUP listener");
 
   let server = TcpListener::bind(("0.0.0.0", app.listenport as u16)).expect("Failed to bind to listen port");
   for client in server.incoming() {
+    if hup.load(Ordering::Relaxed) {
+      match fs::read_to_string("config.yml") {
+        Err(e) => println!("\rFailed to read configuration file: {:?}", e),
+        Ok(data) => match YamlLoader::load_from_str(&data) {
+          Err(e) => println!("\rConfiguration file contains invalid YAML:\n{:?}", e),
+          Ok(docs) => {
+            println!("\r/ SIGHUP received; reloading ruleset");
+            load_rules(&rules, &docs[0]);
+            println!("\\ Reload complete");
+          },
+        }
+      }
+      hup.store(false, Ordering::Relaxed);
+    }
+
     let mut stream = match client {
       Ok(stream) => stream,
       Err(err) => {
@@ -299,8 +312,13 @@ fn main() {
     let re = re.clone();
     let rules = rules.clone();
     let app = app.clone();
+    let start = Instant::now();
 
     thread::spawn(move || { // connection thread
+      {
+        let ms = start.elapsed();
+        if ms.subsec_micros() > 1000 { println!("\rConnection thread startup took {}μs", ms.subsec_micros()); }
+      }
       let threads = THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
       let mut bytes = 0;
       let mut req: [u8; 2048] = [0; 2048];
@@ -384,7 +402,7 @@ fn main() {
         return;
       }
 
-      for rule in rules.iter() {
+      for rule in rules.read().unwrap().iter() {
         if rule.regex.is_match(&connection.hostname) {
           idx = rule.server;
           routing = "rule";
@@ -570,13 +588,20 @@ fn main() {
       let thr_conn = connection.clone();
       let thr_serv = server.clone();
       let thr_app = app.clone();
+      let start = Instant::now();
 
       let inbound = thread::spawn(move || { // inbound data thread
+        {
+          let ms = start.elapsed();
+          if ms.subsec_micros() > 1000 { println!("\rInbound thread startup took {}μs", ms.subsec_micros()); }
+        }
+
         let mut buf: [u8; 1500] = [0; 1500];
         let mut count = 0;
         let mut bytes = 0;
         let mut conn_ms = 0;
         let mut data_ms = 0;
+
         prctl::set_name("Reader").expect("Failed to set process name");
         loop {
           match tunnel_read.read(&mut buf) {
@@ -733,4 +758,16 @@ fn status_page(connection: Connection, mut stream: TcpStream, servers: Vec<Serve
     if stream.write_all(b"</table></body></html>").is_err() { return "Failed to write status page footer to client" }
   }
   return ""
+}
+
+fn load_rules(rules: &Arc<RwLock<Vec<Rule>>>, config: &Yaml) {
+  let mut vec = rules.write().unwrap();
+
+  for (rule, server) in config["rules"].as_hash().expect("Invalid 'rules' setting in config.yml") {
+    let rule = rule.as_str().expect("Invalid key in 'rules' setting in config.yml").to_owned();
+    let server = server.as_i64().expect("Invalid value in 'rules' setting in config.yml") as usize;
+    let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
+    println!("| Added rule {} for server {}", &rule, &server);
+    vec.push(Rule { rule, regex: Regex::new(&pattern).unwrap(), server });
+  }
 }

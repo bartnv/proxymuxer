@@ -8,3 +8,4 @@ authors = ["Bart Noordervliet <bart@mmvi.nl>"]
 yaml-rust = "0.4"
 regex = "1"
 prctl = "1"
+signal-hook = "0.1"
