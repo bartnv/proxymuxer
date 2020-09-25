@@ -2,6 +2,7 @@ extern crate yaml_rust;
 extern crate regex;
 extern crate prctl;
 extern crate signal_hook;
+extern crate crossbeam_channel;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write, ErrorKind, stdout};
@@ -11,11 +12,14 @@ use std::time::{Duration, Instant};
 use std::thread;
 use std::process::Command;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{Ordering, AtomicBool, AtomicUsize, ATOMIC_USIZE_INIT};
+use std::sync::atomic::{Ordering, AtomicBool, AtomicUsize};
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::convert::TryInto;
 use yaml_rust::{Yaml, YamlLoader};
 use regex::Regex;
+use crossbeam_channel::unbounded;
 
 #[derive(Clone)]
 struct App {
@@ -36,9 +40,9 @@ struct Server {
     online: Arc<AtomicBool>,
     online_since: Arc<RwLock<Instant>>,
     responsive: Arc<AtomicBool>,
-    conn_count: Arc<AtomicUsize>,
-    conn_avg: Arc<AtomicUsize>,
-    conn_best: Arc<AtomicUsize>,
+    conn_count: Arc<AtomicUsize>, // These can be change to more appropriate integer atomics starting from Rust 1.34
+    conn_avg: Arc<AtomicUsize>,   // This also allows the use of more sane types in struct Connection
+    conn_best: Arc<AtomicUsize>,  // See: https://doc.rust-lang.org/std/sync/atomic/index.html
     errors: Arc<RwLock<Vec<bool>>>
 }
 impl Server {
@@ -49,8 +53,8 @@ impl Server {
       online: Arc::new(AtomicBool::new(false)),
       online_since: Arc::new(RwLock::new(Instant::now())),
       responsive: Arc::new(AtomicBool::new(true)),
-      conn_count: Arc::new(ATOMIC_USIZE_INIT),
-      conn_avg: Arc::new(ATOMIC_USIZE_INIT),
+      conn_count: Arc::new(AtomicUsize::new(0)),
+      conn_avg: Arc::new(AtomicUsize::new(0)),
       conn_best: Arc::new(AtomicUsize::new(usize::max_value())),
       errors: Arc::new(RwLock::new(vec![false; 10]))
     }
@@ -124,17 +128,27 @@ impl DurationToString for Duration {
       c += 1;
     }
     result.push_str(&format!("{}{}", secs/delta[c], unit[c]));
-    secs = secs%delta[c];
+    secs %= delta[c];
     if secs != 0 {
       c += 1;
       result.push_str(&format!(" {}{}", secs/delta[c], unit[c]));
     }
-    return result;
+    result
   }
 }
 
+enum StatusUpdate {
+    Start(String),
+    End(String, u64, u64)
+}
+struct StatusEntry {
+    ts: Instant,
+    count: u64,
+    outbound: u64,
+    inbound: u64
+}
 
-static THREAD_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
+static THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn main() {
   let mut app = App {
@@ -272,9 +286,36 @@ fn main() {
 
   let rules = Arc::new(RwLock::new(Vec::new()));
   load_rules(&rules, config);
-  drop(config);
+  drop(docs); // Free memory used for config YAML document
   let hup = Arc::new(AtomicBool::new(false));
   signal_hook::flag::register(signal_hook::SIGHUP, Arc::clone(&hup)).expect("Failed to register SIGHUP listener");
+
+  let (status, queue) = unbounded(); // Create channel to send status updates through
+  thread::spawn(move || { // Status reporting thread
+      let mut entries: HashMap<String, StatusEntry> = HashMap::new();
+      loop {
+          match queue.recv().unwrap() {
+              StatusUpdate::Start(hostname) => {
+                  match entries.get_mut(&hostname) {
+                      Some(mut entry) => entry.count += 1,
+                      None => { entries.insert(hostname, StatusEntry { ts: Instant::now(), count: 1, outbound: 0, inbound: 0 }); }
+                  }
+              },
+              StatusUpdate::End(hostname, outbound, inbound) => {
+                  match entries.get_mut(&hostname) {
+                      Some(mut entry) => {
+                          entry.ts = Instant::now();
+                          entry.count -= 1;
+                          entry.outbound += outbound;
+                          entry.inbound += inbound;
+                          // println!("\r{} count {} outbound {} inbound {}", hostname, entry.count, entry.outbound, entry.inbound);
+                      },
+                      None => println!("StatusUpdate::End called for unknown hostname {}", hostname)
+                  }
+              }
+          }
+      }
+  });
 
   let server = TcpListener::bind(("0.0.0.0", app.listenport as u16)).expect("Failed to bind to listen port");
   for client in server.incoming() {
@@ -312,12 +353,13 @@ fn main() {
     let re = re.clone();
     let rules = rules.clone();
     let app = app.clone();
+    let status = status.clone();
     let start = Instant::now();
 
     thread::spawn(move || { // connection thread
       {
         let ms = start.elapsed();
-        if ms.subsec_micros() > 1000 { println!("\rConnection thread startup took {}μs", ms.subsec_micros()); }
+        if ms.as_micros() > 10000 { println!("\rConnection thread startup took {}μs", ms.as_micros()); }
       }
       let threads = THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
       let mut bytes = 0;
@@ -402,6 +444,8 @@ fn main() {
         return;
       }
 
+      status.send(StatusUpdate::Start(connection.hostname.to_owned())).unwrap();
+
       for rule in rules.read().unwrap().iter() {
         if rule.regex.is_match(&connection.hostname) {
           idx = rule.server;
@@ -412,6 +456,7 @@ fn main() {
               match stream.write(b"\x00\x5B") {
                 Ok(2) => (),
                 _ => {
+                  status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
                   cleanup("Failed to write blackhole SOCKS4 response to client");
                   return;
                 }
@@ -421,11 +466,13 @@ fn main() {
               match stream.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00") {
                 Ok(10) => (),
                 _ => {
+                  status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
                   cleanup("Failed to write blackhole SOCKS5 response to client");
                   return;
                 }
               }
             }
+            status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
             cleanup(&format!("{:3} connections | [{}] Routed {}:{} to blackhole", threads, routing, connection.hostname, connection.portno));
             return;
           }
@@ -444,14 +491,16 @@ fn main() {
         match select_server(&pool, hashhost) {
           Ok(i) => idx = i,
           Err(msg) => {
+            status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
             cleanup(msg);
             return;
           }
         }
       }
       let mut server = thr_servers.get(idx).expect("Invalid server index");
-      if server.online.load(Ordering::Relaxed) != true {
+      if !server.online.load(Ordering::Relaxed) {
         if routing == "rule" {
+          status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
           cleanup(&format!("Rule directed server {} is offline", idx));
           return;
         }
@@ -465,6 +514,7 @@ fn main() {
         match result {
           Some(res) => { server = res; }
           None => {
+            status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
             cleanup("No online server found in pool");
             return;
           }
@@ -486,6 +536,7 @@ fn main() {
               match stream.write(b"\x00\x5A") {
                 Ok(2) => (),
                 _ => {
+                  status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
                   cleanup("Failed to write SOCKS4 response to client");
                   return;
                 }
@@ -495,6 +546,7 @@ fn main() {
               match stream.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00") {
                 Ok(10) => (),
                 _ => {
+                  status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
                   cleanup("Failed to write SOCKS5 response to client");
                   return;
                 }
@@ -527,6 +579,7 @@ fn main() {
               }
             }
             cleanup(&error);
+            status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
             return;
           }
         }
@@ -536,6 +589,7 @@ fn main() {
           Ok(stream) => stream,
           Err(_) => {
             server.push_status(true);
+            status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
             cleanup("Failed to connect to tunnel port");
             return;
           }
@@ -551,6 +605,7 @@ fn main() {
             Ok(c) if c == bytes => (),
             _ => {
               server.push_status(true);
+              status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
               cleanup("Failed to write SOCKS4 request to tunnel");
               return;
             }
@@ -561,6 +616,7 @@ fn main() {
             Ok(3) => (),
             _ => {
               server.push_status(true);
+              status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
               cleanup("Failed to write SOCKS5 request to tunnel");
               return;
             }
@@ -569,6 +625,7 @@ fn main() {
             Ok(_) => (),
             _ => {
               server.push_status(true);
+              status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
               cleanup("Failed to read SOCKS5 auth response from tunnel");
               return;
             }
@@ -577,6 +634,7 @@ fn main() {
             Ok(c) if c == bytes => (),
             _ => {
               server.push_status(true);
+              status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
               cleanup("Failed to write SOCKS5 request to tunnel");
               return;
             }
@@ -593,7 +651,7 @@ fn main() {
       let inbound = thread::spawn(move || { // inbound data thread
         {
           let ms = start.elapsed();
-          if ms.subsec_micros() > 1000 { println!("\rInbound thread startup took {}μs", ms.subsec_micros()); }
+          if ms.as_micros() > 10000 { println!("\rInbound thread startup took {}μs", ms.as_micros()); }
         }
 
         let mut buf: [u8; 1500] = [0; 1500];
@@ -613,8 +671,7 @@ fn main() {
               count += 1;
               if count == 1 { // SOCKS server response
                 tunnel_read.set_read_timeout(Some(thr_app.idletimeout)).expect("Failed to set read timeout on TcpStream");
-                conn_ms = (thr_conn.start.elapsed().as_secs()*1000) as usize; // TODO: change this to use Duration::as_millis() as soon as that feature stabilizes
-                conn_ms += thr_conn.start.elapsed().subsec_millis() as usize;
+                conn_ms = thr_conn.start.elapsed().as_millis() as usize;
                 thr_serv.conn_count.fetch_add(1, Ordering::Relaxed);
                 thr_serv.conn_avg.fetch_add(conn_ms, Ordering::Relaxed);
                 // TODO: use AtomicUsize::fetch_min().min() here once the feature stabilizes
@@ -625,8 +682,7 @@ fn main() {
                 }
               }
               else if count == 2 { // First data from remote host
-                data_ms = (thr_conn.start.elapsed().as_secs()*1000) as usize; // TODO: change this to use Duration::as_millis() as soon as that feature stabilizes
-                data_ms += thr_conn.start.elapsed().subsec_millis() as usize;
+                data_ms = thr_conn.start.elapsed().as_millis() as usize;
               }
               if count != 1 { bytes += c; } // Don't count the SOCKS protocol response as payload bytes
               if let Err(e) = stream_write.write_all(&buf[0..c]) {
@@ -691,6 +747,7 @@ fn main() {
       }
 
       server.push_status(connection.errors.contains("tunnel"));
+      status.send(StatusUpdate::End(connection.hostname.to_string(), connection.outbound, connection.inbound.try_into().unwrap())).unwrap();
       cleanup("");
 
       if !app.connlog.is_empty() {
@@ -700,6 +757,7 @@ fn main() {
         else { writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data{}", connection.hostname, connection.portno, routing, server.hostname, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms, connection.errors).unwrap(); }
         file.write_all(&line).expect("\rFailed to write to connection log");
       }
+
     });
   }
 }
@@ -739,6 +797,7 @@ fn status_page(connection: Connection, mut stream: TcpStream, servers: Vec<Serve
                    Content-Type: text/html\r\n\
                    Connection: Close\r\n\r\n\
                    <!doctype html><html><head><title>ProxyMuxer status</title>\n\
+                   <meta http-equiv=\"refresh\" content=\"300\">\n\
                    <style>TABLE { border-collapse: collapse; } TH,TD { border: solid black 1px; padding: 5px; }</style></head>\n\
                    <body><table><tr><th>Server<th>Status<th>Since<th>Connections<th>Error rate<th>Avg connect delay<th>Best connect delay</tr>\n";
     if stream.write_all(headers.as_bytes()).is_err() { return "Failed to write status page headers to client"; }
@@ -757,7 +816,7 @@ fn status_page(connection: Connection, mut stream: TcpStream, servers: Vec<Serve
     }
     if stream.write_all(b"</table></body></html>").is_err() { return "Failed to write status page footer to client" }
   }
-  return ""
+  ""
 }
 
 fn load_rules(rules: &Arc<RwLock<Vec<Rule>>>, config: &Yaml) {
