@@ -103,7 +103,8 @@ struct Matches {
 struct Rule {
   rule: String,
   regex: Regex,
-  server: usize
+  server: usize,
+  hard: bool
 }
 
 pub trait DurationToString {
@@ -210,9 +211,7 @@ fn main() {
   let mut servers: Vec<Server> = Vec::new();
   servers.push(Server::new(0, "blackhole".to_string(), 0));
 
-  let mut count = 0;
-  for entry in config["servers"].as_vec().expect("Invalid 'servers' setting in config.yml") {
-    count += 1;
+  for (count, entry) in config["servers"].as_vec().expect("Invalid 'servers' setting in config.yml").iter().enumerate() {
     let hostname = entry.as_str().expect("Invalid entry in 'servers' setting in config.yml").to_owned();
     let mut server;
     if hostname == "direct" {
@@ -822,11 +821,22 @@ fn status_page(connection: Connection, mut stream: TcpStream, servers: Vec<Serve
 fn load_rules(rules: &Arc<RwLock<Vec<Rule>>>, config: &Yaml) {
   let mut vec = rules.write().unwrap();
 
-  for (rule, server) in config["rules"].as_hash().expect("Invalid 'rules' setting in config.yml") {
-    let rule = rule.as_str().expect("Invalid key in 'rules' setting in config.yml").to_owned();
-    let server = server.as_i64().expect("Invalid value in 'rules' setting in config.yml") as usize;
-    let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
-    println!("| Added rule {} for server {}", &rule, &server);
-    vec.push(Rule { rule, regex: Regex::new(&pattern).unwrap(), server });
+  if !config["hardrules"].is_badvalue() {
+    for (rule, server) in config["hardrules"].as_hash().expect("Invalid 'hardrules' setting in config.yml") {
+      let rule = rule.as_str().expect("Invalid key in 'hardrules' setting in config.yml").to_owned();
+      let server = server.as_i64().expect("Invalid value in 'hardrules' setting in config.yml") as usize;
+      let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
+      println!("| Added hard rule {} for server {}", &rule, &server);
+      vec.push(Rule { rule, regex: Regex::new(&pattern).unwrap(), server, hard: true });
+    }
+  }
+  if !config["softrules"].is_badvalue() {
+    for (rule, server) in config["softrules"].as_hash().expect("Invalid 'softrules' setting in config.yml") {
+      let rule = rule.as_str().expect("Invalid key in 'softrules' setting in config.yml").to_owned();
+      let server = server.as_i64().expect("Invalid value in 'softrules' setting in config.yml") as usize;
+      let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
+      println!("| Added hard rule {} for server {}", &rule, &server);
+      vec.push(Rule { rule, regex: Regex::new(&pattern).unwrap(), server, hard: false });
+    }
   }
 }
