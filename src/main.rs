@@ -676,6 +676,7 @@ fn main() {
                 // TODO: use AtomicUsize::fetch_min().min() here once the feature stabilizes
                 if conn_ms < thr_serv.conn_best.load(Ordering::Relaxed) { thr_serv.conn_best.store(conn_ms, Ordering::Relaxed); }
                 if buf[0] == 5 && buf[1] != 0 {
+                  thr_serv.push_status(true);
                   println!("\rServer {} returned SOCKS5 status code {:02X}", thr_serv.hostname, buf[1]);
                   return (0, 0, 0, " / server returned SOCKS5 error code");
                 }
@@ -745,7 +746,7 @@ fn main() {
         }
       }
 
-      server.push_status(connection.errors.contains("tunnel"));
+      // server.push_status(connection.errors.contains("tunnel"));
       status.send(StatusUpdate::End(connection.hostname.to_string(), connection.outbound, connection.inbound.try_into().unwrap())).unwrap();
       cleanup("");
 
