@@ -83,13 +83,14 @@ struct Connection {
   portno: u16,
   outbound: u64,
   inbound: usize,
+  prox_ms: usize,
   conn_ms: usize,
   data_ms: usize,
   errors: String
 }
 impl Connection {
   fn new(peer_addr: SocketAddr) -> Connection {
-    Connection { peer_addr, start: Instant::now(), proto: 0, hostname: String::new(), portno: 0, outbound: 0, inbound: 0, conn_ms: 0, data_ms: 0, errors: String::new() }
+    Connection { peer_addr, start: Instant::now(), proto: 0, hostname: String::new(), portno: 0, outbound: 0, inbound: 0, prox_ms: 0, conn_ms: 0, data_ms: 0, errors: String::new() }
   }
 }
 
@@ -629,6 +630,7 @@ fn main() {
               return;
             }
           }
+          connection.prox_ms = connection.start.elapsed().as_millis() as usize;
           match tunnel.write(&req[0..bytes]) {
             Ok(c) if c == bytes => (),
             _ => {
@@ -753,8 +755,8 @@ fn main() {
       if !app.connlog.is_empty() {
         let mut file = OpenOptions::new().append(true).create(true).open(&app.connlog).expect("Failed to open connection log file");
         let mut line = Vec::new();
-        if connection.outbound == 0 { writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s without requests", connection.hostname, connection.portno, routing, server.hostname, connection.start.elapsed().as_secs()).unwrap(); }
-        else { writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s with {}b outbound, {}b inbound / timings: {}ms connect {}ms first data{}", connection.hostname, connection.portno, routing, server.hostname, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.conn_ms, connection.data_ms, connection.errors).unwrap(); }
+        if connection.outbound == 0 { writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s without requests", connection.hostname, connection.portno, &routing[0..4], server.hostname, connection.start.elapsed().as_secs()).unwrap(); }
+        else { writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s with {}b outbound, {}b inbound / timings: {}ms proxy_rtt {}ms dest_connect {}ms first_data{}", connection.hostname, connection.portno, &routing[0..4], server.hostname, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.prox_ms, connection.conn_ms, connection.data_ms, connection.errors).unwrap(); }
         file.write_all(&line).expect("\rFailed to write to connection log");
       }
 
