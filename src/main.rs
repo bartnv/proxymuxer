@@ -28,7 +28,15 @@ struct App {
   sshargs: String,
   connlog: String,
   conntimeout: Duration,
-  idletimeout: Duration
+  idletimeout: Duration,
+  loglevel: LogLevel
+}
+
+#[derive(Clone, PartialEq, PartialOrd)]
+enum LogLevel {
+  Error,
+  Info,
+  Debug
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +73,7 @@ impl Server {
     errors.push(is_error);
   }
   fn get_error_pct(&self) -> u16 {
+    if !self.online.load(Ordering::Relaxed) { return 100; }
     let errors = self.errors.read().unwrap();
     let mut count = 0;
     for error in errors.iter() {
@@ -86,11 +95,12 @@ struct Connection {
   prox_ms: usize,
   conn_ms: usize,
   data_ms: usize,
+  proxy_err: bool,
   errors: String
 }
 impl Connection {
   fn new(peer_addr: SocketAddr) -> Connection {
-    Connection { peer_addr, start: Instant::now(), proto: 0, hostname: String::new(), portno: 0, outbound: 0, inbound: 0, prox_ms: 0, conn_ms: 0, data_ms: 0, errors: String::new() }
+    Connection { peer_addr, start: Instant::now(), proto: 0, hostname: String::new(), portno: 0, outbound: 0, inbound: 0, prox_ms: 0, conn_ms: 0, data_ms: 0, proxy_err: false, errors: String::new() }
   }
 }
 
@@ -158,8 +168,9 @@ fn main() {
     startport: 61234,
     sshargs: String::from("-N"),
     connlog: String::new(),
-    conntimeout: Duration::new(10, 0), // 10 seconds
-    idletimeout: Duration::new(300, 0) // 5 minutes
+    conntimeout: Duration::new(10, 0),  // 10 seconds
+    idletimeout: Duration::new(300, 0), // 5 minutes
+    loglevel: LogLevel::Info
   };
   let mut file = File::open("config.yml").expect("Failed to read configuration file: config.yml");
   let mut config_str = String::new();
@@ -208,6 +219,14 @@ fn main() {
     app.idletimeout = Duration::new(seconds as u64, 0);
     println!("Idle timeout set to {} seconds", seconds);
   }
+  if !config["loglevel"].is_badvalue() {
+    app.loglevel = match config["loglevel"].as_str().expect("Invalid 'loglevel' setting in config.yml") {
+      "debug" => LogLevel::Debug,
+      "info" => LogLevel::Info,
+      "error" => LogLevel::Error,
+      _ => panic!("Invalid 'loglevel' setting in config.yml: must be 'debug', 'info' or 'error'")
+    }
+  }
 
   let mut servers: Vec<Server> = Vec::new();
   servers.push(Server::new(0, "blackhole".to_string(), 0));
@@ -251,11 +270,8 @@ fn main() {
         }
         let mut child = cmd.arg(server.hostname.clone()).spawn().unwrap_or_else(|_| panic!("Failed to launch ssh session to {}", server.hostname));
         server.online.store(true, Ordering::Relaxed);
-        {
-          let mut instant = server.online_since.write().unwrap();
-          *instant = Instant::now();
-        }
-        let ecode = child.wait().expect("Failed to wait on child");
+        server.online_since.write().unwrap().clone_from(&Instant::now());
+        let ecode = child.wait().expect("Failed to wait on child"); // This is where all the actual work happens
         server.online.store(false, Ordering::Relaxed);
         if !ecode.success() {
             match ecode.code() {
@@ -366,12 +382,18 @@ fn main() {
       let mut req: [u8; 2048] = [0; 2048];
       match stream.read(&mut req) {
         Ok(c) => {
-          if c == 0 { println!("\rIncoming connection from {} closed before protocol exchange", connection.peer_addr); }
+          if c == 0 {
+            if app.loglevel >= LogLevel::Debug { println!("\rIncoming connection from {} closed before protocol exchange", connection.peer_addr); }
+          }
           else if req[0] == 5 { // SOCKS5
             match stream.write(b"\x05\x00") {
               Ok(2) => { connection.proto = 5; },
-              Err(e) => { println!("\rIncoming connection from {} lost during protocol exchange: {}", connection.peer_addr, e.to_string()); },
-              _ => { println!("\rIncoming connection from {} lost during protocol exchange", connection.peer_addr); }
+              Err(e) => {
+                if app.loglevel >= LogLevel::Debug { println!("\rIncoming connection from {} lost during protocol exchange: {}", connection.peer_addr, e.to_string()); }
+              },
+              _ => {
+                if app.loglevel >= LogLevel::Debug { println!("\rIncoming connection from {} lost during protocol exchange", connection.peer_addr); }
+              }
             }
           }
           else if req[0] == 4 { // SOCKS4
@@ -383,15 +405,18 @@ fn main() {
             thread::sleep(Duration::new(5, 0)); // Some devices retry immediately, so throttle a little here
           }
         }
-        Err(e) => { println!("\rIncoming connection from {} lost before protocol exchange: {}", connection.peer_addr, e.to_string()); }
+        Err(e) => {
+          if app.loglevel >= LogLevel::Debug { println!("\rIncoming connection from {} lost before protocol exchange: {}", connection.peer_addr, e.to_string()); }
+        }
       }
-      if connection.proto == 0 { cleanup(""); return; } // Protocol negotiation failed
+      if connection.proto == 0 { cleanup(""); return; } // Protocol negotiation failed; error reported above
 
       if connection.proto == 5 {
         match stream.read(&mut req) {
           Ok(c) if c > 0 => { bytes = c },
           _ => {
-            cleanup(&format!("Incoming connection from {} closed after protocol exchange", connection.peer_addr));
+            if app.loglevel >= LogLevel::Debug { cleanup(&format!("Incoming connection from {} closed after protocol exchange", connection.peer_addr)); }
+            else { cleanup(""); }
             return;
           }
         }
@@ -449,7 +474,8 @@ fn main() {
       for rule in rules.read().unwrap().iter() {
         if rule.regex.is_match(&connection.hostname) {
           idx = rule.server;
-          routing = "rule";
+          if rule.hard { routing = "rulehard"; }
+          else { routing = "rulesoft" };
           if idx == 0 { // idx 0 is the blackhole route
             thr_servers[0].conn_count.fetch_add(1, Ordering::Relaxed);
             if connection.proto == 4 {
@@ -473,14 +499,15 @@ fn main() {
               }
             }
             status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
-            cleanup(&format!("{:3} connections | [{}] Routed {}:{} to blackhole", threads, routing, connection.hostname, connection.portno));
+            if app.loglevel >= LogLevel::Info { cleanup(&format!("{:3} connections | [rule] Routed {}:{} to blackhole", threads, connection.hostname, connection.portno)); }
+            else { cleanup(""); }
             return;
           }
           prctl::set_name(&format!("Rule {}", rule.rule)).expect("Failed to set process name");
           break;
         }
       }
-      if routing != "rule" {
+      if routing == "hash" {
         let hashhost =
           if let Some(captures) = re.ipv4.captures(&connection.hostname) { captures.get(1).unwrap().as_str() }
           else if let Some(captures) = re.ipv6.captures(&connection.hostname) { captures.get(1).unwrap().as_str() }
@@ -497,37 +524,61 @@ fn main() {
           }
         }
       }
+
+      // At this point `routing` is set to either "rulehard", "rulesoft", or "hash", and `idx` is
+      // set to the index of the preferred server within the Vec `thr_servers`. If the server is
+      // online and the routing was not from a hard rule, we can try another one. If the server is
+      // giving errors, make it more likely the server is skipped the more the error rate increases.
+
+      assert!(idx != 0);
       let mut server = thr_servers.get(idx).expect("Invalid server index");
-      if !server.online.load(Ordering::Relaxed) {
-        if routing == "rule" {
-          status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
-          cleanup(&format!("Rule directed server {} is offline", idx));
-          return;
-        }
-        let mut i = 0;
-        let result = loop {
-          if i == pool.len() { break None; }
-          let server = thr_servers.get(pool[i]).expect("Invalid server index in pool");
-          if server.online.load(Ordering::Relaxed) { break Some(server); }
-          i += 1;
-        };
-        match result {
-          Some(res) => { server = res; }
-          None => {
+      let pct = server.get_error_pct();
+      let rand = start.elapsed().subsec_micros()%100;
+      if rand < pct.into() { // Use this Duration as a cheap random number
+        if routing == "rulehard" {
+          if pct == 100 {
             status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
-            cleanup("No online server found in pool");
+            cleanup(&format!("Rule directed server {} is offline", idx));
             return;
+          }
+        }
+        else {
+          let start = idx%pool.len();
+          let mut i = start;
+          let result = loop {
+            if pool[i] != idx {
+              let server = thr_servers.get(pool[i]).expect("Invalid server index in pool");
+              if server.online.load(Ordering::Relaxed) { break Some(server); }
+            }
+            i += 1;
+            if i == pool.len() { i = 0; }
+            if i == start { break None; }
+          };
+          match result {
+            Some(res) => {
+              println!("\rSelected alternative server {} due to {}% errors on {}", res.hostname, pct, server.hostname);
+              server = res;
+              idx = server.id;
+            }
+            None => {
+              status.send(StatusUpdate::End(connection.hostname.to_string(), 0, 0)).unwrap();
+              cleanup("No online server found in pool");
+              return;
+            }
           }
         }
       }
 
-      match server.get_error_pct() {
-        0 => (),
-        n => println!("\rServer {} has {}% error rate", idx, n)
-      }
-
       let server = server;
-      println!("\r{:3} connections | [{}] Routed {}:{} to server {} ({})", threads, routing, connection.hostname, connection.portno, idx, server.hostname);
+      if app.loglevel >= LogLevel::Info {
+          println!("\r{:3} connections | [{}] Routed {}:{} to server {} ({}){}",
+            threads, &routing[0..4], connection.hostname, connection.portno, idx, server.hostname,
+            match server.get_error_pct() {
+                0 => String::new(),
+                n => format!(" [{}% error rate]", n)
+            }
+          );
+      }
 
       let mut tunnel = if server.portno == 0 { // Handle direct connection case (server has portno set to zero)
         match TcpStream::connect((&*connection.hostname, connection.portno)) {
@@ -642,6 +693,11 @@ fn main() {
           }
         }
       }
+
+      // At this point the SOCKS request of the client has been relayed to the chosen server;
+      // just shovel data back and forth using a separate thread for inbound data and the
+      // current thread for outbound.
+
       let mut tunnel_read = tunnel.try_clone().expect("Failed to clone tunnel TcpStream");
       let mut stream_write = stream.try_clone().expect("Failed to clone client TcpStream");
       let thr_conn = connection.clone();
@@ -667,7 +723,7 @@ fn main() {
             Ok(c) => {
               if c == 0 {
                 let _ = stream_write.shutdown(std::net::Shutdown::Both);
-                return (bytes, conn_ms, data_ms, "");
+                return (false, bytes, conn_ms, data_ms, "");
               }
               count += 1;
               if count == 1 { // SOCKS server response
@@ -678,9 +734,8 @@ fn main() {
                 // TODO: use AtomicUsize::fetch_min().min() here once the feature stabilizes
                 if conn_ms < thr_serv.conn_best.load(Ordering::Relaxed) { thr_serv.conn_best.store(conn_ms, Ordering::Relaxed); }
                 if buf[0] == 5 && buf[1] != 0 {
-                  thr_serv.push_status(true);
                   println!("\rServer {} returned SOCKS5 status code {:02X}", thr_serv.hostname, buf[1]);
-                  return (0, 0, 0, " / server returned SOCKS5 error code");
+                  return (true, 0, 0, 0, " / server returned SOCKS5 error code");
                 }
               }
               else if count == 2 { // First data from remote host
@@ -688,19 +743,25 @@ fn main() {
               }
               if count != 1 { bytes += c; } // Don't count the SOCKS protocol response as payload bytes
               if let Err(e) = stream_write.write_all(&buf[0..c]) {
-                println!("\r[{}/{}] Write error on client: {}", thr_serv.hostname, thr_conn.hostname, e.to_string());
-                return (bytes, conn_ms, data_ms, " / write error on client");
+                if thr_app.loglevel >= LogLevel::Debug { println!("\r[{}/{}] Write error on client: {}", thr_serv.hostname, thr_conn.hostname, e.to_string()); }
+                return (false, bytes, conn_ms, data_ms, " / write error on client");
               }
             }
             Err(e) => {
               let _ = stream_write.shutdown(std::net::Shutdown::Both);
               if e.kind() == ErrorKind::WouldBlock {
-                println!("\r[{}/{}] Read timeout on tunnel ({} bytes read)", thr_serv.hostname, thr_conn.hostname, bytes);
-                return (bytes, conn_ms, data_ms, " / read timeout on tunnel");
+                if count == 0 {
+                  println!("\r[{}/{}] Read timeout on tunnel (connection failed)", thr_serv.hostname, thr_conn.hostname);
+                  return (true, bytes, conn_ms, data_ms, " / read timeout on tunnel (connection failed)");
+                }
+                else {
+                  println!("\r[{}/{}] Read timeout on tunnel ({} bytes read)", thr_serv.hostname, thr_conn.hostname, bytes);
+                  return (false, bytes, conn_ms, data_ms, " / read timeout on tunnel");
+                }
               }
               else {
                 println!("\r[{}/{}] Read error on tunnel: {}", thr_serv.hostname, thr_conn.hostname, e.to_string());
-                return (bytes, conn_ms, data_ms, " / read error on tunnel");
+                return (false, bytes, conn_ms, data_ms, " / read error on tunnel");
               }
             }
           }
@@ -727,7 +788,7 @@ fn main() {
               }
             }
             else {
-              println!("\r[{}/{}] Read error on client: {}", server.hostname, connection.hostname, e.to_string());
+              if app.loglevel >= LogLevel::Debug { println!("\r[{}/{}] Read error on client: {}", server.hostname, connection.hostname, e.to_string()); }
               connection.errors.push_str(" / read error on client");
               let _ = tunnel.shutdown(std::net::Shutdown::Both);
             }
@@ -736,7 +797,8 @@ fn main() {
         }
       }
       match inbound.join() {
-        Ok((inbound, conn_ms, data_ms, errors)) => {
+        Ok((proxy_err, inbound, conn_ms, data_ms, errors)) => {
+          connection.proxy_err = proxy_err;
           connection.inbound = inbound;
           connection.conn_ms = conn_ms;
           connection.data_ms = data_ms;
@@ -748,14 +810,15 @@ fn main() {
         }
       }
 
-      // server.push_status(connection.errors.contains("tunnel"));
+      server.push_status(connection.proxy_err);
       status.send(StatusUpdate::End(connection.hostname.to_string(), connection.outbound, connection.inbound.try_into().unwrap())).unwrap();
       cleanup("");
 
       if !app.connlog.is_empty() {
         let mut file = OpenOptions::new().append(true).create(true).open(&app.connlog).expect("Failed to open connection log file");
         let mut line = Vec::new();
-        if connection.outbound == 0 { writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s without requests", connection.hostname, connection.portno, &routing[0..4], server.hostname, connection.start.elapsed().as_secs()).unwrap(); }
+        if connection.proxy_err { writeln!(line, "Connection to {}:{} {}-routed through {} failed to establish within {}s", connection.hostname, connection.portno, &routing[0..4], server.hostname, connection.start.elapsed().as_secs()).unwrap(); }
+        else if connection.outbound == 0 { writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s without requests", connection.hostname, connection.portno, &routing[0..4], server.hostname, connection.start.elapsed().as_secs()).unwrap(); }
         else { writeln!(line, "Connection to {}:{} {}-routed through {} finished after {}s with {}b outbound, {}b inbound / timings: {}ms proxy_rtt {}ms dest_connect {}ms first_data{}", connection.hostname, connection.portno, &routing[0..4], server.hostname, connection.start.elapsed().as_secs(), connection.outbound, connection.inbound, connection.prox_ms, connection.conn_ms, connection.data_ms, connection.errors).unwrap(); }
         file.write_all(&line).expect("\rFailed to write to connection log");
       }
@@ -838,7 +901,7 @@ fn load_rules(rules: &Arc<RwLock<Vec<Rule>>>, config: &Yaml) {
       let rule = rule.as_str().expect("Invalid key in 'softrules' setting in config.yml").to_owned();
       let server = server.as_i64().expect("Invalid value in 'softrules' setting in config.yml") as usize;
       let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
-      println!("| Added hard rule {} for server {}", &rule, &server);
+      println!("| Added soft rule {} for server {}", &rule, &server);
       vec.push(Rule { rule, regex: Regex::new(&pattern).unwrap(), server, hard: false });
     }
   }
