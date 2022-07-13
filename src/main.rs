@@ -20,6 +20,7 @@ use std::convert::TryInto;
 use yaml_rust::{Yaml, YamlLoader};
 use regex::Regex;
 use crossbeam_channel::unbounded;
+use signal_hook::consts::signal;
 
 #[derive(Clone)]
 struct App {
@@ -79,7 +80,7 @@ impl Server {
     for error in errors.iter() {
       if *error { count += 10; }
     }
-    count
+    if count > 95 { 95 } else { count }
   }
 }
 
@@ -119,10 +120,10 @@ struct Rule {
 }
 
 pub trait DurationToString {
-  fn to_string(self) -> String;
+  fn to_string(&self) -> String;
 }
 impl DurationToString for Duration {
-  fn to_string(self) -> String {
+  fn to_string(&self) -> String {
     let mut secs = self.as_secs();
     let mut result = String::with_capacity(10);
 
@@ -304,7 +305,7 @@ fn main() {
   load_rules(&rules, config);
   drop(docs); // Free memory used for config YAML document
   let hup = Arc::new(AtomicBool::new(false));
-  signal_hook::flag::register(signal_hook::SIGHUP, Arc::clone(&hup)).expect("Failed to register SIGHUP listener");
+  signal_hook::flag::register(signal::SIGHUP, Arc::clone(&hup)).expect("Failed to register SIGHUP listener");
 
   let (status, queue) = unbounded(); // Create channel to send status updates through
   thread::spawn(move || { // Status reporting thread

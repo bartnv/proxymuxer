@@ -1,12 +1,12 @@
 [package]
 name = "proxymuxer"
-version = "0.2.0"
-edition = "2018"
+version = "0.2.1"
+edition = "2021"
 authors = ["Bart Noordervliet <bart@mmvi.nl>"]
 
 [dependencies]
 yaml-rust = "0.4"
 regex = "1"
 prctl = "1"
-signal-hook = "0.1"
-crossbeam-channel = "0.4"
+signal-hook = "0.3"
+crossbeam-channel = "0.5"
