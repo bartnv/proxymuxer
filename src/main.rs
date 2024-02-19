@@ -362,7 +362,7 @@ fn main() {
     stream.set_read_timeout(Some(app.conntimeout)).expect("Failed to set read timeout on TcpStream");
     stream.set_write_timeout(Some(app.conntimeout)).expect("Failed to set write timeout on TcpStream");
     if stream.peer_addr().is_err() {
-      println!("\rFailed to get peer_addr() from stream: {}", stream.peer_addr().unwrap_err().to_string());
+      println!("\rFailed to get peer_addr() from stream: {}", stream.peer_addr().unwrap_err());
       continue;
     }
     let mut connection = Connection::new(stream.peer_addr().unwrap());
@@ -391,7 +391,7 @@ fn main() {
             match stream.write(b"\x05\x00") {
               Ok(2) => { connection.proto = 5; },
               Err(e) => {
-                if app.loglevel >= LogLevel::Debug { println!("\rIncoming connection from {} lost during protocol exchange: {}", connection.peer_addr, e.to_string()); }
+                if app.loglevel >= LogLevel::Debug { println!("\rIncoming connection from {} lost during protocol exchange: {}", connection.peer_addr, e); }
               },
               _ => {
                 if app.loglevel >= LogLevel::Debug { println!("\rIncoming connection from {} lost during protocol exchange", connection.peer_addr); }
@@ -408,7 +408,7 @@ fn main() {
           }
         }
         Err(e) => {
-          if app.loglevel >= LogLevel::Debug { println!("\rIncoming connection from {} lost before protocol exchange: {}", connection.peer_addr, e.to_string()); }
+          if app.loglevel >= LogLevel::Debug { println!("\rIncoming connection from {} lost before protocol exchange: {}", connection.peer_addr, e); }
         }
       }
       if connection.proto == 0 { cleanup(""); return; } // Protocol negotiation failed; error reported above
@@ -745,7 +745,7 @@ fn main() {
               }
               if count != 1 { bytes += c; } // Don't count the SOCKS protocol response as payload bytes
               if let Err(e) = stream_write.write_all(&buf[0..c]) {
-                if thr_app.loglevel >= LogLevel::Debug { println!("\r[{}/{}] Write error on client: {}", thr_serv.hostname, thr_conn.hostname, e.to_string()); }
+                if thr_app.loglevel >= LogLevel::Debug { println!("\r[{}/{}] Write error on client: {}", thr_serv.hostname, thr_conn.hostname, e); }
                 return (false, bytes, conn_ms, data_ms, " / write error on client");
               }
             }
@@ -762,7 +762,7 @@ fn main() {
                 }
               }
               else {
-                println!("\r[{}/{}] Read error on tunnel: {}", thr_serv.hostname, thr_conn.hostname, e.to_string());
+                println!("\r[{}/{}] Read error on tunnel: {}", thr_serv.hostname, thr_conn.hostname, e);
                 return (false, bytes, conn_ms, data_ms, " / read error on tunnel");
               }
             }
@@ -777,7 +777,7 @@ fn main() {
             if connection.outbound == 0 { stream.set_read_timeout(Some(app.idletimeout)).expect("Failed to set read timeout on TcpStream"); }
             connection.outbound += c as u64;
             if let Err(e) = tunnel.write_all(&buf[0..c]) {
-              println!("\r[{}/{}] Write error on tunnel: {}", server.hostname, connection.hostname, e.to_string());
+              println!("\r[{}/{}] Write error on tunnel: {}", server.hostname, connection.hostname, e);
               connection.errors.push_str(" / write error on tunnel");
               break;
             }
@@ -790,7 +790,7 @@ fn main() {
               }
             }
             else {
-              if app.loglevel >= LogLevel::Debug { println!("\r[{}/{}] Read error on client: {}", server.hostname, connection.hostname, e.to_string()); }
+              if app.loglevel >= LogLevel::Debug { println!("\r[{}/{}] Read error on client: {}", server.hostname, connection.hostname, e); }
               connection.errors.push_str(" / read error on client");
               let _ = tunnel.shutdown(std::net::Shutdown::Both);
             }
@@ -893,7 +893,7 @@ fn load_rules(rules: &Arc<RwLock<Vec<Rule>>>, config: &Yaml) {
     for (rule, server) in config["hardrules"].as_hash().expect("Invalid 'hardrules' setting in config.yml") {
       let rule = rule.as_str().expect("Invalid key in 'hardrules' setting in config.yml").to_owned();
       let server = server.as_i64().expect("Invalid value in 'hardrules' setting in config.yml") as usize;
-      let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
+      let pattern = format!("(.*\\.)?{}", rule.replace('.', "\\."));
       println!("| Added hard rule {} for server {}", &rule, &server);
       vec.push(Rule { rule, regex: Regex::new(&pattern).unwrap(), server, hard: true });
     }
@@ -902,7 +902,7 @@ fn load_rules(rules: &Arc<RwLock<Vec<Rule>>>, config: &Yaml) {
     for (rule, server) in config["softrules"].as_hash().expect("Invalid 'softrules' setting in config.yml") {
       let rule = rule.as_str().expect("Invalid key in 'softrules' setting in config.yml").to_owned();
       let server = server.as_i64().expect("Invalid value in 'softrules' setting in config.yml") as usize;
-      let pattern = format!("(.*\\.)?{}", rule.replace(".", "\\."));
+      let pattern = format!("(.*\\.)?{}", rule.replace('.', "\\."));
       println!("| Added soft rule {} for server {}", &rule, &server);
       vec.push(Rule { rule, regex: Regex::new(&pattern).unwrap(), server, hard: false });
     }
