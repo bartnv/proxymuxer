@@ -1,6 +1,5 @@
 extern crate yaml_rust;
 extern crate regex;
-extern crate prctl;
 extern crate signal_hook;
 extern crate crossbeam_channel;
 
@@ -17,10 +16,12 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::convert::TryInto;
+use std::ffi::CString;
 use yaml_rust::{Yaml, YamlLoader};
 use regex::Regex;
 use crossbeam_channel::unbounded;
 use signal_hook::consts::signal;
+use nix::sys::prctl;
 
 #[derive(Clone)]
 struct App {
@@ -255,7 +256,7 @@ fn main() {
 
     let argstring = app.sshargs.clone();
     thread::spawn(move || {
-      prctl::set_name(&format!("Server {}", server.id)).expect("Failed to set process name");
+      prctl::set_name(&CString::new(format!("Server {}", server.id)).unwrap()).expect("Failed to set process name");
       let recon_delay = Duration::new(60, 0);
       thread::sleep(Duration::new(1, 0));
       loop {
@@ -314,13 +315,13 @@ fn main() {
           match queue.recv().unwrap() {
               StatusUpdate::Start(hostname) => {
                   match entries.get_mut(&hostname) {
-                      Some(mut entry) => entry.count += 1,
+                      Some(entry) => entry.count += 1,
                       None => { entries.insert(hostname, StatusEntry { ts: Instant::now(), count: 1, outbound: 0, inbound: 0 }); }
                   }
               },
               StatusUpdate::End(hostname, outbound, inbound) => {
                   match entries.get_mut(&hostname) {
-                      Some(mut entry) => {
+                      Some(entry) => {
                           entry.ts = Instant::now();
                           entry.count -= 1;
                           entry.outbound += outbound;
@@ -504,7 +505,7 @@ fn main() {
             else { cleanup(""); }
             return;
           }
-          prctl::set_name(&format!("Rule {}", rule.rule)).expect("Failed to set process name");
+          prctl::set_name(&CString::new(format!("Rule {}", rule.rule)).unwrap()).expect("Failed to set process name");
           break;
         }
       }
@@ -515,7 +516,7 @@ fn main() {
           else if let Some(captures) = re.host1.captures(&connection.hostname) { captures.get(1).unwrap().as_str() }
           else if let Some(captures) = re.host2.captures(&connection.hostname) { captures.get(1).unwrap().as_str() }
           else { &connection.hostname };
-        prctl::set_name(&format!("Hash {}", hashhost)).expect("Failed to set process name");
+        prctl::set_name(&CString::new(format!("Hash {}", hashhost)).unwrap()).expect("Failed to set process name");
         match select_server(&pool, hashhost) {
           Ok(i) => idx = i,
           Err(msg) => {
@@ -718,7 +719,7 @@ fn main() {
         let mut conn_ms = 0;
         let mut data_ms = 0;
 
-        prctl::set_name("Reader").expect("Failed to set process name");
+        prctl::set_name(&CString::new("Reader").unwrap()).expect("Failed to set process name");
         loop {
           match tunnel_read.read(&mut buf) {
             Ok(c) => {
